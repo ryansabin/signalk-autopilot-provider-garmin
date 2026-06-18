@@ -1,0 +1,21 @@
+{
+  "name": "signalk-autopilot-provider-garmin",
+  "version": "0.1.0-dev.0",
+  "description": "Signal K v2 Autopilot Provider for Garmin Reactor autopilots (NMEA 2000, proprietary PGN 126720)",
+  "main": "index.js",
+  "scripts": {
+    "test": "node -e \"require('./index.js'); require('./garmin_pilot.js'); console.log('load OK');\""
+  },
+  "keywords": [
+    "signalk-node-server-plugin",
+    "signalk-category-autopilot",
+    "garmin",
+    "reactor",
+    "autopilot",
+    "nmea2000"
+  ],
+  "author": "Buttercup project",
+  "license": "Apache-2.0",
+  "dependencies": {},
+  "repository": { "type": "git", "url": "" }
+}
