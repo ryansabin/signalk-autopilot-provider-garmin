@@ -73,8 +73,10 @@ module.exports = function (app) {
 
   const seen = new Map()      // 'hi:lo' -> [timestamps ms]
   let lastWindAngle = null
-  let lastHeading = null      // radians, vessel heading from PGN 127250 (CCU)
-  let trackedTarget = null    // radians, target heading tracked locally in auto mode
+  let lastHeading = null         // radians, vessel heading from PGN 127250 (CCU)
+  let lastApparentWind = null    // radians (signed +-pi), apparent wind angle from PGN 130306
+  let trackedTarget = null       // radians, target heading tracked locally in auto mode
+  let trackedWind = null         // radians (signed +-pi), desired wind angle tracked in wind mode
   let evalTimer = null
   let kaTimer = null
   let candump = null
@@ -114,9 +116,10 @@ module.exports = function (app) {
     send(util.format(CMD.state, now(), srcAddr, ccuAddr, code))
     status.state = value
     status.engaged = (value !== 'standby')
-    // Locally track the target heading (the CCU doesn't broadcast it decodably).
-    if (value === 'auto') trackedTarget = lastHeading   // engage holds current heading
-    else trackedTarget = null                            // standby/wind: no heading target
+    // Locally track the target (the CCU doesn't broadcast it decodably).
+    if (value === 'auto') { trackedTarget = lastHeading; trackedWind = null }            // hold current heading
+    else if (value === 'wind') { trackedWind = lastApparentWind; trackedTarget = null }  // hold current apparent wind angle
+    else { trackedTarget = null; trackedWind = null }                                    // standby
     return status.engaged
   }
 
@@ -130,9 +133,14 @@ module.exports = function (app) {
     const code = HEADING_CODE[step]
     if (code === undefined) throw new Error('Cannot map adjustment to a Garmin step')
     send(util.format(CMD.heading, now(), srcAddr, ccuAddr, code))
-    // advance our locally-tracked target by the quantized step actually commanded
-    if (trackedTarget !== null) {
-      trackedTarget += (parseInt(step, 10) * Math.PI / 180)
+    // advance whichever target is active by the quantized step actually commanded
+    const stepRad = parseInt(step, 10) * Math.PI / 180
+    if (status.state === 'wind' && trackedWind !== null) {
+      trackedWind += stepRad
+      while (trackedWind > Math.PI) trackedWind -= 2 * Math.PI
+      while (trackedWind < -Math.PI) trackedWind += 2 * Math.PI
+    } else if (trackedTarget !== null) {
+      trackedTarget += stepRad
       while (trackedTarget < 0) trackedTarget += 2 * Math.PI
       while (trackedTarget >= 2 * Math.PI) trackedTarget -= 2 * Math.PI
     }
@@ -224,6 +232,15 @@ module.exports = function (app) {
       }
       return
     }
+    // PGN 130306 Wind Data: byte0=SID, b3-4 = wind angle u16 * 1e-4 rad, b5 = reference (2 = apparent)
+    if (pgn === 130306) {
+      if (data.length >= 6 && (data[5] & 0x07) === 2) {
+        let a = (data[3] | (data[4] << 8)) * 1e-4
+        if (a > Math.PI) a -= 2 * Math.PI   // 0..2pi -> signed +-pi (negative = port)
+        if (a >= -Math.PI && a <= Math.PI) lastApparentWind = a
+      }
+      return
+    }
     if (pgn !== 126720) return
     // fast-packet reassembly
     const seqhi = data[0] & 0xe0
@@ -272,7 +289,7 @@ module.exports = function (app) {
     const wasEngaged = status.engaged === true
     let state, mode, engaged, target = null
     if (windHits >= WIND_MIN) {
-      state = 'wind'; mode = 'wind'; engaged = true; target = lastWindAngle
+      state = 'wind'; mode = 'wind'; engaged = true; target = trackedWind
     } else if (engHits >= ENGAGED_MIN || (wasEngaged && engHits >= ENGAGED_KEEP)) {
       // engage on >=2 markers; once engaged, stay engaged while >=1 marker is still seen
       state = 'auto'; mode = 'auto'; engaged = true; target = trackedTarget
