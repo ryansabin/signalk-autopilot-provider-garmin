@@ -33,6 +33,13 @@ const CMD = {
 const HEADING_CODE = { '1': '02', '10': '03', '15': '03', '-1': '00', '-10': '01', '-15': '01' }
 const STATE_CODE = { auto: '05', standby: '02', wind: '11' }
 
+// Controller-registration keepalive. The GHC heads broadcast this ~2 Hz to the
+// CCU; without it the Reactor treats us as an unregistered sender and faults to
+// standby on a heading-adjust. Payload mirrors a head's keepalive (byte8=02 =>
+// active controller). Sending it makes the CCU accept our heading nudges.
+const KEEPALIVE = '%s,7,126720,%s,%s,0C,E5,98,10,17,04,04,15,03,02,00,C8,00'
+const KEEPALIVE_MS = 500
+
 const AP_OPTIONS = {
   states: [
     { name: 'auto', engaged: true },
@@ -46,9 +53,10 @@ const AP_OPTIONS = {
 const WIND_FID = [0x00, 0x0B]
 const ENGAGED_FIDS = [[0x00, 0xA2], [0x02, 0x74], [0x00, 0x72]]
 const WIND_WINDOW_MS = 1500
-const ENGAGED_WINDOW_MS = 2500
+const ENGAGED_WINDOW_MS = 3000
 const WIND_MIN = 3
-const ENGAGED_MIN = 2
+const ENGAGED_MIN = 2     // markers needed to ASSERT engaged (standby -> engaged)
+const ENGAGED_KEEP = 1    // markers needed to STAY engaged (hysteresis; avoids flap on bursty markers)
 const EVAL_MS = 500
 
 const util = require('util')
@@ -60,11 +68,13 @@ module.exports = function (app) {
   let srcAddr = '3'
   let ccuAddr = '2'      // Reactor CCU N2K source address (discovered or configured)
   let canInterface = 'can0'
+  let registerController = true   // broadcast the controller keepalive (needed for heading nudges)
   let discovered = false
 
   const seen = new Map()      // 'hi:lo' -> [timestamps ms]
   let lastWindAngle = null
   let evalTimer = null
+  let kaTimer = null
   let candump = null
   const asm = {}              // fast-packet reassembly: key -> { len, bytes }
 
@@ -75,13 +85,16 @@ module.exports = function (app) {
     srcAddr = props.srcAddr || srcAddr
     ccuAddr = props.ccuAddr || ccuAddr
     canInterface = props.canInterface || canInterface
-    app.debug('Garmin Reactor provider start. srcAddr=%s ccuAddr=%s if=%s', srcAddr, ccuAddr, canInterface)
+    if (props.registerController !== undefined) registerController = props.registerController
+    app.debug('Garmin Reactor provider start. srcAddr=%s ccuAddr=%s if=%s register=%s', srcAddr, ccuAddr, canInterface, registerController)
     startCanReader()
     evalTimer = setInterval(evaluate, EVAL_MS)
+    if (registerController) kaTimer = setInterval(() => { app.emit('nmea2000out', util.format(KEEPALIVE, now(), srcAddr, ccuAddr)) }, KEEPALIVE_MS)
   }
 
   pilot.stop = () => {
     if (evalTimer) { clearInterval(evalTimer); evalTimer = null }
+    if (kaTimer) { clearInterval(kaTimer); kaTimer = null }
     if (candump) { try { candump.kill() } catch (e) {} candump = null }
   }
 
@@ -147,7 +160,8 @@ module.exports = function (app) {
       properties: {
         ccuAddr: { type: 'string', title: 'Garmin Reactor CCU NMEA2000 address', description: desc, default: ccuAddr || '2' },
         srcAddr: { type: 'string', title: 'Source address this plugin transmits from', description: 'Use a free N2K address.', default: srcAddr },
-        canInterface: { type: 'string', title: 'CAN interface to read for status', description: 'socketcan interface the CCU is on (read directly via candump).', default: canInterface }
+        canInterface: { type: 'string', title: 'CAN interface to read for status', description: 'socketcan interface the CCU is on (read directly via candump).', default: canInterface },
+        registerController: { type: 'boolean', title: 'Register as a controller (keepalive)', description: 'Broadcast the GHC controller keepalive so the CCU accepts heading-adjust commands. Required for heading nudges.', default: true }
       }
     }
   }
@@ -236,8 +250,16 @@ module.exports = function (app) {
     let engHits = 0
     ENGAGED_FIDS.forEach((f) => { engHits += cnt(f[0] + ':' + f[1], ENGAGED_WINDOW_MS) })
 
+    const wasEngaged = status.engaged === true
     let state, mode, engaged, target = null
-    if (windHits >= WIND_MIN) { state = 'wind'; mode = 'wind'; engaged = true; target = lastWindAngle } else if (engHits >= ENGAGED_MIN) { state = 'auto'; mode = 'auto'; engaged = true } else { state = 'standby'; mode = 'standby'; engaged = false }
+    if (windHits >= WIND_MIN) {
+      state = 'wind'; mode = 'wind'; engaged = true; target = lastWindAngle
+    } else if (engHits >= ENGAGED_MIN || (wasEngaged && engHits >= ENGAGED_KEEP)) {
+      // engage on >=2 markers; once engaged, stay engaged while >=1 marker is still seen
+      state = 'auto'; mode = 'auto'; engaged = true
+    } else {
+      state = 'standby'; mode = 'standby'; engaged = false
+    }
 
     const changed = state !== status.state
     if (changed) app.debug('Garmin AP state -> %s (wind=%d eng=%d)', state, windHits, engHits)
