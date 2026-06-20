@@ -136,7 +136,9 @@ module.exports = function (app) {
     // advance whichever target is active by the quantized step actually commanded
     const stepRad = parseInt(step, 10) * Math.PI / 180
     if (status.state === 'wind' && trackedWind !== null) {
-      trackedWind += stepRad
+      // a +course step turns the boat to starboard, which moves the signed wind
+      // angle negative (more port) — opposite sign to the heading target. Matches GHC.
+      trackedWind -= stepRad
       while (trackedWind > Math.PI) trackedWind -= 2 * Math.PI
       while (trackedWind < -Math.PI) trackedWind += 2 * Math.PI
     } else if (trackedTarget !== null) {
