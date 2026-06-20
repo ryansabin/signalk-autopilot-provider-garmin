@@ -3,15 +3,22 @@
 /*
  * Garmin Reactor autopilot — device logic for the Signal K v2 provider.
  *
- * PROVEN vs HYPOTHESIS:
- *  - Commands (PGN 126720 -> CCU): ported verbatim from
- *    jorgen-k/signalk-autopilot-garmin (Apache-2.0), reported working on a
- *    Reactor 40 + GHC-20. Covers state auto/standby/wind and heading nudge +-1/+-15.
- *    >>> Re-verify on Buttercup's Reactor 40 (SW 10.10) before trusting. <<<
- *  - Status decode (reading mode/target/engaged from the CCU's 126720 broadcasts)
- *    is NOT yet reverse engineered by anyone. onStreamEvent() below is a SKELETON
- *    with documented byte hypotheses, to be filled from dock correlation captures.
- *    Until then getData() returns nulls.
+ * STATUS (verified live on Buttercup's Reactor 40, 2026-06-20):
+ *  - Commands (PGN 126720 -> CCU) CONFIRMED by button-press correlation:
+ *      state set:  E5 98 10 17 04 04 05 0A 00 <code>   standby=02 auto=05 wind=11
+ *      heading nudge: E5 98 10 17 04 04 26 <code>      -1=00 -10=01 +1=02 +10=03
+ *    (jorgen-k labelled the big step "15"; on the Reactor 40 / GHC the wire code
+ *     is identical, the degrees come from the head's configured increment.)
+ *  - Status read-back DECODED from the CCU's own 126720 broadcasts (src=2):
+ *    the CCU emits "field" sub-messages  E5 98 10 17 04 04 <fid_hi> <fid_lo> ...
+ *    Mode is conveyed by which fields are present:
+ *      field 00 0B  -> WIND mode; payload carries target apparent wind angle
+ *                      as a little-endian float32 (radians) at marker+7.
+ *      fields 00 A2 / 02 74 / 00 72  -> present only when ENGAGED (auto or wind),
+ *                      absent in standby. Used as the engaged/standby discriminator.
+ *    => no 00 0B and no engaged-markers  => STANDBY.
+ *    Target HEADING field is not yet isolated (needs a stationary capture); until
+ *    then target is published only in wind mode.
  */
 
 const apType = 'garminReactor'
@@ -21,9 +28,6 @@ const AP_DISCOVERY_TEXT = 'Reactor'
 
 // Commands: PGN 126720 addressed to the CCU. canboat "plain" wire format emitted
 // via 'nmea2000out':  <ISO8601>,<prio>,<pgn>,<src>,<dst>,<len>,<byte>,<byte>,...
-// %s placeholders, in order: timestamp, src, dst, code.
-// Container: E5 98 = Garmin(229)+Marine; 10 17 04 04 = Reactor AP data group; then
-// a command selector. Ported verbatim from jorgen-k/signalk-autopilot-garmin.
 const CMD = {
   // selector 26 = relative heading change
   heading: '%s,7,126720,%s,%s,09,E5,98,10,17,04,04,26,%s,00,FF,FF,FF,FF',
@@ -31,20 +35,28 @@ const CMD = {
   state:   '%s,7,126720,%s,%s,0B,E5,98,10,17,04,04,05,0A,00,%s,00,FF,FF'
 }
 
-// degrees -> code. NOTE: jorgen labelled the big step '15'; the Reactor/GHC big
-// step may actually be 10 deg. Confirm the real increment from captures.
-const HEADING_CODE = { '1': '02', '15': '03', '-1': '00', '-15': '01' }
+// degrees -> code. Verified on Reactor 40: small step (+-1) and big step (the GHC
+// big-step button, 10 deg on Buttercup). Both 10 and 15 map to the big-step code.
+const HEADING_CODE = { '1': '02', '10': '03', '15': '03', '-1': '00', '-10': '01', '-15': '01' }
 const STATE_CODE = { auto: '05', standby: '02', wind: '11' }
 
 const AP_OPTIONS = {
   states: [
     { name: 'auto', engaged: true },
     { name: 'wind', engaged: true },
-    { name: 'route', engaged: true },     // command not yet known (TODO capture)
     { name: 'standby', engaged: false }
   ],
   modes: []
 }
+
+// Status-decode tuning
+const WIND_FID = [0x00, 0x0B]                                  // wind-mode field (+ target wind angle)
+const ENGAGED_FIDS = [[0x00, 0xA2], [0x02, 0x74], [0x00, 0x72]] // present only when engaged
+const WIND_WINDOW_MS = 2000      // wind field is high-rate; recent presence => wind
+const ENGAGED_WINDOW_MS = 4000   // engaged markers are ~1 Hz
+const WIND_MIN = 3               // min hits in window to assert wind
+const ENGAGED_MIN = 2            // min hits in window to assert engaged (reject strays)
+const EVAL_MS = 1000
 
 const util = require('util')
 
@@ -55,6 +67,10 @@ module.exports = function (app) {
   let ccuAddr = null     // discovered Reactor CCU N2K source address (e.g. '2')
   let discovered = false
 
+  const seen = new Map()      // 'hi:lo' -> [timestamps ms]
+  let lastWindAngle = null    // radians, from the 00 0B field
+  let evalTimer = null
+
   const pilot = { id: null, type: apType }
 
   pilot.start = (props) => {
@@ -63,10 +79,12 @@ module.exports = function (app) {
     ccuAddr = props.ccuAddr || ccuAddr
     app.debug('Garmin Reactor provider start. srcAddr=%s ccuAddr=%s', srcAddr, ccuAddr)
     app.on('N2KAnalyzerOut', onStreamEvent)
+    evalTimer = setInterval(evaluate, EVAL_MS)
   }
 
   pilot.stop = () => {
     try { app.removeListener('N2KAnalyzerOut', onStreamEvent) } catch (e) {}
+    if (evalTimer) { clearInterval(evalTimer); evalTimer = null }
   }
 
   pilot.getData = () => ({
@@ -142,31 +160,55 @@ module.exports = function (app) {
     }
   }
 
-  // ---- Status decode (SKELETON — fill from dock captures) ----
-  // The CCU broadcasts PGN 126720 with the same Garmin container we send commands in:
-  //   [E5 98] 10 17 04 04 <subtype> <...>
-  // canboat does not yet decode Garmin AP 126720, so we parse raw bytes ourselves.
-  // The exact evt shape (whether E5 98 is included, where Data lives) must be
-  // confirmed from live decoded output on Buttercup — hence the marker search.
+  // ---- Status decode (VERIFIED structure; see header) ----
   const onStreamEvent = (evt) => {
     if (!evt || evt.pgn !== 126720) return
     if (ccuAddr !== null && String(evt.src) !== String(ccuAddr)) return
     const bytes = rawBytes(evt)
     if (!bytes) return
     const m = findMarker(bytes)           // index of [10 17 04 04]
-    if (m === -1) return
-    const subtype = bytes[m + 4]
-    // TODO(capture): map subtype + following bytes to state/mode/target.
-    // Hypotheses to confirm with baseline + per-button diffs:
-    //   - a state/mode subtype whose byte encodes standby/auto/wind/route
-    //   - a target-heading subtype carrying a 16-bit angle (likely rad*1e4, LE)
-    //   - keepalive/heartbeat subtype(s) to ignore
-    app.debug('126720 CCU subtype=0x%s raw=%s', (subtype || 0).toString(16), hex(bytes))
-    // When decoded, publish e.g.:
-    //   status.state = ...; status.engaged = ...
-    //   app.autopilotUpdate(apType, 'state', status.state)
-    //   app.autopilotUpdate(apType, 'engaged', status.engaged)
-    //   app.autopilotUpdate(apType, 'target', angleRad)
+    if (m === -1 || m + 5 >= bytes.length) return
+    const fhi = bytes[m + 4]
+    const flo = bytes[m + 5]
+    const key = fhi + ':' + flo
+    const arr = seen.get(key) || []
+    arr.push(Date.now())
+    seen.set(key, arr)
+    // wind-mode field also carries the target apparent wind angle (LE float32, rad)
+    if (fhi === WIND_FID[0] && flo === WIND_FID[1] && m + 10 < bytes.length) {
+      const f = readFloatLE(bytes, m + 7)
+      if (f !== null && isFinite(f) && Math.abs(f) < 7) lastWindAngle = f
+    }
+  }
+
+  function evaluate () {
+    const t = Date.now()
+    const cnt = (k, win) => {
+      const arr = (seen.get(k) || []).filter((ts) => t - ts <= win)
+      seen.set(k, arr)
+      return arr.length
+    }
+    const windHits = cnt(WIND_FID[0] + ':' + WIND_FID[1], WIND_WINDOW_MS)
+    let engHits = 0
+    ENGAGED_FIDS.forEach((f) => { engHits += cnt(f[0] + ':' + f[1], ENGAGED_WINDOW_MS) })
+
+    let state, mode, engaged, target = null
+    if (windHits >= WIND_MIN) {
+      state = 'wind'; mode = 'wind'; engaged = true; target = lastWindAngle
+    } else if (engHits >= ENGAGED_MIN) {
+      state = 'auto'; mode = 'auto'; engaged = true
+    } else {
+      state = 'standby'; mode = 'standby'; engaged = false
+    }
+
+    const changed = state !== status.state
+    if (changed) app.debug('Garmin AP state -> %s (wind=%d eng=%d)', state, windHits, engHits)
+    status.state = state; status.mode = mode; status.engaged = engaged; status.target = target
+    if (typeof app.autopilotUpdate === 'function') {
+      try {
+        app.autopilotUpdate(apType, { state, mode, engaged, target })
+      } catch (e) { if (changed) app.debug('autopilotUpdate failed: ' + e.message) }
+    }
   }
 
   // ---- helpers ----
@@ -178,7 +220,7 @@ module.exports = function (app) {
   function now () { return new Date().toISOString() }
   function radToDeg (r) { return (typeof r === 'number' ? r : 0) * 180 / Math.PI }
   function quantizeStep (deg) {
-    const sz = Math.abs(deg) >= 8 ? 15 : 1   // big vs small step; refine after verifying real increment
+    const sz = Math.abs(deg) >= 6 ? 10 : 1   // big-step button is 10 deg on the GHC
     return (deg < 0 ? '-' : '') + sz
   }
   function rawBytes (evt) {
@@ -193,6 +235,11 @@ module.exports = function (app) {
       if (b[i] === 0x10 && b[i + 1] === 0x17 && b[i + 2] === 0x04 && b[i + 3] === 0x04) return i
     }
     return -1
+  }
+  function readFloatLE (b, off) {
+    if (off + 3 >= b.length) return null
+    const buf = Buffer.from([b[off], b[off + 1], b[off + 2], b[off + 3]])
+    return buf.readFloatLE(0)
   }
   function hex (arr) { return arr.map((x) => ('0' + (x & 0xff).toString(16)).slice(-2)).join(' ') }
 
