@@ -73,6 +73,8 @@ module.exports = function (app) {
 
   const seen = new Map()      // 'hi:lo' -> [timestamps ms]
   let lastWindAngle = null
+  let lastHeading = null      // radians, vessel heading from PGN 127250 (CCU)
+  let trackedTarget = null    // radians, target heading tracked locally in auto mode
   let evalTimer = null
   let kaTimer = null
   let candump = null
@@ -112,6 +114,9 @@ module.exports = function (app) {
     send(util.format(CMD.state, now(), srcAddr, ccuAddr, code))
     status.state = value
     status.engaged = (value !== 'standby')
+    // Locally track the target heading (the CCU doesn't broadcast it decodably).
+    if (value === 'auto') trackedTarget = lastHeading   // engage holds current heading
+    else trackedTarget = null                            // standby/wind: no heading target
     return status.engaged
   }
 
@@ -125,6 +130,12 @@ module.exports = function (app) {
     const code = HEADING_CODE[step]
     if (code === undefined) throw new Error('Cannot map adjustment to a Garmin step')
     send(util.format(CMD.heading, now(), srcAddr, ccuAddr, code))
+    // advance our locally-tracked target by the quantized step actually commanded
+    if (trackedTarget !== null) {
+      trackedTarget += (parseInt(step, 10) * Math.PI / 180)
+      while (trackedTarget < 0) trackedTarget += 2 * Math.PI
+      while (trackedTarget >= 2 * Math.PI) trackedTarget -= 2 * Math.PI
+    }
   }
 
   pilot.setTarget = () => { throw new Error('setTarget not implemented (no known Garmin absolute-heading PGN); use adjustTarget') }
@@ -205,6 +216,14 @@ module.exports = function (app) {
     const dp = (canId >> 24) & 1
     let pgn, dst
     if (pf < 240) { pgn = (dp << 16) | (pf << 8); dst = ps } else { pgn = (dp << 16) | (pf << 8) | ps; dst = 255 }
+    // PGN 127250 Vessel Heading (single frame): byte0=SID, bytes1-2 = heading u16 * 1e-4 rad
+    if (pgn === 127250) {
+      if (String(sa) === String(ccuAddr) && data.length >= 3) {
+        const h = (data[1] | (data[2] << 8)) * 1e-4
+        if (h >= 0 && h < 7) lastHeading = h
+      }
+      return
+    }
     if (pgn !== 126720) return
     // fast-packet reassembly
     const seqhi = data[0] & 0xe0
@@ -256,10 +275,12 @@ module.exports = function (app) {
       state = 'wind'; mode = 'wind'; engaged = true; target = lastWindAngle
     } else if (engHits >= ENGAGED_MIN || (wasEngaged && engHits >= ENGAGED_KEEP)) {
       // engage on >=2 markers; once engaged, stay engaged while >=1 marker is still seen
-      state = 'auto'; mode = 'auto'; engaged = true
+      state = 'auto'; mode = 'auto'; engaged = true; target = trackedTarget
     } else {
       state = 'standby'; mode = 'standby'; engaged = false
     }
+    // trackedTarget lifecycle is driven by setState/adjustTarget (commands), not by
+    // the detected state, so the engage transient doesn't wipe it.
 
     const changed = state !== status.state
     if (changed) app.debug('Garmin AP state -> %s (wind=%d eng=%d)', state, windHits, engHits)
