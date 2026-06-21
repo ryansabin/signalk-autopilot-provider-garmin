@@ -209,8 +209,8 @@ module.exports = function (app) {
   }
 
   pilot.setTarget = () => { throw new Error('setTarget not implemented (no known Garmin absolute-heading PGN); use adjustTarget') }
-  pilot.tack = (direction) => engagePattern('tack', direction || 'starboard')
-  pilot.gybe = (direction) => engagePattern('gybe', direction || 'starboard')
+  pilot.tack = (direction) => engagePattern('tack', direction)
+  pilot.gybe = (direction) => engagePattern('gybe', direction)
   pilot.dodge = () => { throw new Error('dodge not implemented for Garmin Reactor') }
 
   // ---- Discovery + config schema ----
@@ -563,9 +563,29 @@ module.exports = function (app) {
   // Engage a steering pattern / maneuver by name (+ direction). Sends the selector frame
   // (if any) then the engage state. GPS patterns need an active route; sailing maneuvers
   // need wind/heading hold engaged first.
+  // Pick the turn direction for a tack/gybe from the apparent wind. The CCU only accepts the
+  // ONE valid direction for the current point of sail (verified live: tack turns TOWARD the
+  // wind, gybe turns AWAY from it); a wrong direction is silently ignored. Returns 'starboard'
+  // or 'port', or null if no wind is available. dir 00 = starboard turn, 01 = port turn.
+  function maneuverDir (name) {
+    let wa = lastApparentWind
+    if ((wa === null || !isFinite(wa)) && typeof app.getSelfPath === 'function') {
+      const v = app.getSelfPath('environment.wind.angleApparent.value')
+      if (typeof v === 'number' && isFinite(v)) wa = v
+    }
+    if (wa === null || !isFinite(wa)) return null
+    const windStbd = wa > 0                                       // +ve apparent angle = wind on starboard
+    if (name === 'tack') return windStbd ? 'starboard' : 'port'   // tack: turn toward the wind
+    return windStbd ? 'port' : 'starboard'                        // gybe: turn away from the wind
+  }
+
   function engagePattern (name, dirS) {
     const p = PATTERNS[name]
     if (!p) throw new Error('unknown pattern: ' + name)
+    if ((name === 'tack' || name === 'gybe') && !dirS) {
+      dirS = maneuverDir(name)
+      if (!dirS) throw new Error('no apparent wind available to choose ' + name + ' direction')
+    }
     const dir = (dirS === 'stbd' || dirS === 'starboard' || dirS === '0' || dirS === '00') ? '00' : '01'
     if (p.sel) send(util.format(PAT_SEL, now(), srcAddr, ccuAddr, p.sel, dir))
     send(util.format(CMD.state, now(), srcAddr, ccuAddr, p.code))
