@@ -63,7 +63,11 @@ const PATTERNS = {
   zigzag:     { sel: null, code: '09' },
   circles:    { sel: '34', code: '08' },
   uturn:      { sel: '6F', code: '0B' },
-  williamson: { sel: '47', code: '0A' }
+  williamson: { sel: '47', code: '0A' },
+  // GPS patterns — require active navigation (a Go-To / route) on the chartplotter
+  orbit:      { sel: '5B', code: '0F' },
+  cloverleaf: { sel: '3E', code: '0E' },
+  search:     { sel: '65', code: '10' }
 }
 
 const AP_OPTIONS = {
