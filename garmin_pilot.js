@@ -56,6 +56,16 @@ const JOG_PULSE_MS = 150                            // spacing between jog frame
 const JOG_MAX_PULSES = 80                           // safety cap on one centering run
 const JOG_NUDGE_MS = 250                            // drive window for one manual jog tap (~1.5-2 deg)
 
+// Steering patterns (powerboat). Each = a selector frame 04 <sel> 00 <dir> then the engage
+// state 05 0A 00 <code>. Zigzag has no selector. dir 00/01 = port/starboard.
+const PAT_SEL = '%s,7,126720,%s,%s,0A,E5,98,10,17,04,04,04,%s,00,%s,FF,FF,FF,FF,FF,FF'
+const PATTERNS = {
+  zigzag:     { sel: null, code: '09' },
+  circles:    { sel: '34', code: '08' },
+  uturn:      { sel: '6F', code: '0B' },
+  williamson: { sel: '47', code: '0A' }
+}
+
 const AP_OPTIONS = {
   states: [
     { name: 'auto', engaged: true },
@@ -441,7 +451,24 @@ module.exports = function (app) {
       stopDrive()
       return { state: 'COMPLETED', statusCode: 200, message: 'stopped' }
     })
-    app.debug('rudder PUT handlers registered (jog, center, stop)')
+    // DEBUG/RE: send a raw state code (05 0A 00 <hh>) through canboatjs. value = 2-hex string.
+    app.registerPutHandler('vessels.self', 'steering.autopilot.rudder.rawstate', (ctx, path, value, cb) => {
+      try { const c = ('' + ((value && value.value) || value)).trim(); send(util.format(CMD.state, now(), srcAddr, ccuAddr, c)); return { state: 'COMPLETED', statusCode: 200, message: 'state ' + c } } catch (e) { return { state: 'COMPLETED', statusCode: 502, message: e.message } }
+    })
+    // Engage a steering pattern. value = "<name>:<dir>", e.g. "circles:stbd", "uturn:port", "zigzag".
+    app.registerPutHandler('vessels.self', 'steering.autopilot.rudder.pattern', (ctx, path, value, cb) => {
+      try {
+        const v = ('' + ((value && value.value) || value)).trim()
+        const [name, dirS] = v.split(':')
+        const p = PATTERNS[name]
+        if (!p) throw new Error('unknown pattern: ' + name)
+        const dir = (dirS === 'stbd' || dirS === 'starboard' || dirS === '0' || dirS === '00') ? '00' : '01'
+        if (p.sel) send(util.format(PAT_SEL, now(), srcAddr, ccuAddr, p.sel, dir))
+        send(util.format(CMD.state, now(), srcAddr, ccuAddr, p.code))
+        return { state: 'COMPLETED', statusCode: 200, message: 'pattern ' + name + (p.sel ? ' ' + (dir === '00' ? 'stbd' : 'port') : '') }
+      } catch (e) { return { state: 'COMPLETED', statusCode: 502, message: e.message } }
+    })
+    app.debug('rudder PUT handlers registered (jog, center, stop, rawstate)')
   }
 
   // ---- helpers ----

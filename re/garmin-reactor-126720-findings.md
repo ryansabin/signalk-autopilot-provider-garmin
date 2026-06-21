@@ -36,7 +36,7 @@ pattern codes were confirmed in power-displacement vessel mode on 2026-06-21):
 |---|---|---|
 | Standby (disengage) | `02` | clutch released |
 | Heading hold | `05` | clutch engages, display "Heading Hold" |
-| Heading hold (2nd code) | `06` | also engages heading hold — verified by hand; the blind probe had wrongly tagged it inert |
+| Hard-turn / constant-rudder | `06` | **At the dock** it looks like heading hold (clutch in, "Heading Hold" shown). **Underway it pins the rudder hard over (~−27°) and circles the boat continuously** — NOT heading hold. Identity TBD (constant-rudder turn mode). |
 | Wind hold | `11` | sailboat; CCU then broadcasts wind-target field `00 0B` |
 | **Autopilot Setup Mode** | `07` | display "Autopilot in Setup Mode"; drives the rudder briefly (commissioning state), not a runtime steering mode |
 | Steering-test drive | `15` | engages drive and drives the rudder (see rudder section) |
@@ -93,6 +93,14 @@ Confirmed live on the bus (no rudder command appears).
 
 GPS-based patterns (orbit / cloverleaf / search) require active navigation to a waypoint
 (Go To / Route To) and follow-route — not yet captured.
+
+**Underway verification (2026-06-21, open water, calibrated pilot, helm manned).** Every
+engage command was driven through the plugin and confirmed by the boat's behaviour:
+heading hold (`05`) held course; wind hold (`11`) held the apparent wind angle; zigzag (`09`)
+wove; circles (`08`) circled at a steady rudder; u-turn (`0B`) made a clean 180°; williamson
+(`0A`) turned out and back. **U-turn and williamson auto-revert to heading hold on completion.**
+The patterns are now engaged by the plugin's `pattern` PUT (`steering.autopilot.rudder.pattern`,
+value `"<name>:<dir>"`), which sends the selector then the engage frame.
 
 ### POWERBOAT RUDDER STEERING — `E5 98 10 17 04 04 04 2A 00 <dir>`
 
