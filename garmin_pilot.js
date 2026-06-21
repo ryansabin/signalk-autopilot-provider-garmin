@@ -78,12 +78,15 @@ const AP_OPTIONS = {
 // Status-decode tuning
 const WIND_FID = [0x00, 0x0B]
 const ENGAGED_FIDS = [[0x00, 0xA2], [0x02, 0x74], [0x00, 0x72]]
-const WIND_WINDOW_MS = 1500
-const ENGAGED_WINDOW_MS = 3000
+// The CCU broadcasts engaged/wind markers continuously at ~24 Hz while engaged, so a tight
+// window with a low threshold tracks the true state within ~1 s and drops to standby promptly.
+// (The old 3 s window + "stay engaged on 1 marker" hysteresis lagged badly — it falsely held
+// engaged for seconds after a real standby. Removed.)
+const WIND_WINDOW_MS = 1300
+const ENGAGED_WINDOW_MS = 1300
 const WIND_MIN = 3
-const ENGAGED_MIN = 2     // markers needed to ASSERT engaged (standby -> engaged)
-const ENGAGED_KEEP = 1    // markers needed to STAY engaged (hysteresis; avoids flap on bursty markers)
-const EVAL_MS = 500
+const ENGAGED_MIN = 2     // markers in the window to report engaged (no hysteresis)
+const EVAL_MS = 400
 
 const util = require('util')
 const { spawn } = require('child_process')
@@ -329,12 +332,13 @@ module.exports = function (app) {
     let engHits = 0
     ENGAGED_FIDS.forEach((f) => { engHits += cnt(f[0] + ':' + f[1], ENGAGED_WINDOW_MS) })
 
-    const wasEngaged = status.engaged === true
     let state, mode, engaged, target = null
     if (windHits >= WIND_MIN) {
       state = 'wind'; mode = 'wind'; engaged = true; target = trackedWind
-    } else if (engHits >= ENGAGED_MIN || (wasEngaged && engHits >= ENGAGED_KEEP)) {
-      // engage on >=2 markers; once engaged, stay engaged while >=1 marker is still seen
+    } else if (engHits >= ENGAGED_MIN) {
+      // engaged whenever the CCU is currently broadcasting the engaged markers (tight window).
+      // NOTE: heading hold, nav-follow and the steering patterns all share these markers, so
+      // this reports engaged/standby reliably but does not distinguish those sub-modes.
       state = 'auto'; mode = 'auto'; engaged = true; target = trackedTarget
     } else {
       state = 'standby'; mode = 'standby'; engaged = false
@@ -363,7 +367,7 @@ module.exports = function (app) {
   //   stopDrive  -> 05 0A 00 02  (standby = stop & release)
   //   jogFrame   -> 04 15 00 dir (drive one direction; the CCU keeps driving until stopped)
   function assertTest () { send(util.format(CMD.state, now(), srcAddr, ccuAddr, TEST_STATE_CODE)); inTest = true }
-  function stopDrive () { send(util.format(CMD.state, now(), srcAddr, ccuAddr, STATE_CODE.standby)); inTest = false; testCooldownUntil = Date.now() + 3500 }
+  function stopDrive () { send(util.format(CMD.state, now(), srcAddr, ccuAddr, STATE_CODE.standby)); inTest = false; testCooldownUntil = Date.now() + 1500 }
   function jogFrame (code) { send(util.format(JOG, now(), srcAddr, ccuAddr, code)) }
 
   // ---- Clutch: persistent steering-test drive ----
