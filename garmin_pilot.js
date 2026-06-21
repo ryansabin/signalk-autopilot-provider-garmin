@@ -132,6 +132,7 @@ module.exports = function (app) {
   pilot.stop = () => {
     if (evalTimer) { clearInterval(evalTimer); evalTimer = null }
     if (kaTimer) { clearInterval(kaTimer); kaTimer = null }
+    if (routeTimer) { clearInterval(routeTimer); routeTimer = null }
     if (inTest) { try { stopDrive() } catch (e) {} }
     if (candump) { try { candump.kill() } catch (e) {} candump = null }
   }
@@ -434,6 +435,87 @@ module.exports = function (app) {
     return result + (end === null ? '' : ' @' + end.toFixed(1) + 'deg')
   }
 
+  // ---- Route follow: drive a waypoint from our side (no chartplotter Go-To needed) ----
+  // The CCU follows the standard nav PGNs the chartplotter normally broadcasts. We generate
+  // them ourselves from the live GPS position toward a target waypoint, then engage nav-follow
+  // (state 0D). Templates captured live from this boat's GPSMAP; we patch in distance, bearing
+  // and destination (129284) and cross-track error (129283), keeping the other fields as-is.
+  // NOTE: the chartplotter must NOT be navigating, or it will broadcast conflicting nav data.
+  const NAV284 = [0xFF, 0x59, 0xF3, 0x00, 0x00, 0x00, 0x40, 0x8C, 0x5A, 0x29, 0x91, 0x50, 0x7C, 0x4A, 0x45, 0x4A, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x25, 0x45, 0x65, 0x16, 0x21, 0x32, 0x27, 0xB7, 0xFF, 0x7F]
+  const NAV283 = [0xFF, 0xF1, 0x55, 0x01, 0x00, 0x00]
+  // 129285 Route/WP Information template (from the GPSMAP). Declares the active route + its
+  // destination waypoint; we patch the waypoint lat (bytes 32-35) and lon (36-39).
+  const NAV285 = [0xFF, 0xFF, 0x02, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xE0, 0x02, 0x01, 0xFF, 0xFF, 0xFF, 0x02, 0x01, 0xFF, 0xFF, 0xFF, 0x7F, 0xFF, 0xFF, 0xFF, 0x7F, 0x08, 0x00, 0x06, 0x01, 0x30, 0x30, 0x39, 0x33, 0x25, 0x45, 0x65, 0x16, 0x21, 0x32, 0x27, 0xB7]
+  const NAV_MS = 500
+  let routeTarget = null
+  let routeStart = null
+  let routeTimer = null
+  let nav285ctr = 0
+
+  function toRad (d) { return d * Math.PI / 180 }
+  function distBrg (la1, lo1, la2, lo2) {
+    const R = 6371000, p1 = toRad(la1), p2 = toRad(la2), dp = toRad(la2 - la1), dl = toRad(lo2 - lo1)
+    const a = Math.sin(dp / 2) ** 2 + Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2) ** 2
+    const dist = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+    let brg = Math.atan2(Math.sin(dl) * Math.cos(p2), Math.cos(p1) * Math.sin(p2) - Math.sin(p1) * Math.cos(p2) * Math.cos(dl))
+    if (brg < 0) brg += 2 * Math.PI
+    return { dist, brg }
+  }
+  function crossTrack (la1, lo1, laS, loS, laT, loT) {
+    const R = 6371000
+    const a = distBrg(laS, loS, la1, lo1)
+    const brg12 = distBrg(laS, loS, laT, loT).brg
+    return Math.asin(Math.sin(a.dist / R) * Math.sin(a.brg - brg12)) * R
+  }
+  function putI32LE (b, off, v) { v |= 0; b[off] = v & 0xFF; b[off + 1] = (v >> 8) & 0xFF; b[off + 2] = (v >> 16) & 0xFF; b[off + 3] = (v >> 24) & 0xFF }
+  function putU16LE (b, off, v) { b[off] = v & 0xFF; b[off + 1] = (v >> 8) & 0xFF }
+  function emitPgn (pgn, bytes) {
+    const hex = bytes.map((v) => ('0' + (v & 0xFF).toString(16)).slice(-2).toUpperCase()).join(',')
+    app.emit('nmea2000out', util.format('%s,3,%d,%s,255,%d,%s', now(), pgn, srcAddr, bytes.length, hex))
+  }
+  function emitNav () {
+    const pos = (typeof app.getSelfPath === 'function') ? app.getSelfPath('navigation.position.value') : null
+    if (!pos || !routeTarget || typeof pos.latitude !== 'number') return
+    const { dist, brg } = distBrg(pos.latitude, pos.longitude, routeTarget.lat, routeTarget.lon)
+    let xte = 0
+    try { if (routeStart) xte = crossTrack(pos.latitude, pos.longitude, routeStart.lat, routeStart.lon, routeTarget.lat, routeTarget.lon) } catch (e) {}
+    const b = NAV284.slice()
+    putI32LE(b, 1, Math.max(0, Math.round(dist * 100)))          // distance, 0.01 m
+    const bu = Math.round(brg / 0.0001) & 0xFFFF
+    putU16LE(b, 12, bu); putU16LE(b, 14, bu)                      // bearing origin->dest, pos->dest (rad*1e4)
+    putI32LE(b, 24, Math.round(routeTarget.lat * 1e7))           // dest latitude
+    putI32LE(b, 28, Math.round(routeTarget.lon * 1e7))           // dest longitude
+    emitPgn(129284, b)
+    const x = NAV283.slice()
+    putI32LE(x, 2, Math.round(xte * 100))                        // XTE, 0.01 m (signed)
+    emitPgn(129283, x)
+    // 129285 Route/WP Information at a lower rate (~1 Hz) — declares the active route.
+    nav285ctr = (nav285ctr + 1) % 2
+    if (nav285ctr === 0) {
+      const r = NAV285.slice()
+      putI32LE(r, 32, Math.round(routeTarget.lat * 1e7))
+      putI32LE(r, 36, Math.round(routeTarget.lon * 1e7))
+      emitPgn(129285, r)
+    }
+  }
+  function gotoStart (lat, lon) {
+    const pos = (typeof app.getSelfPath === 'function') ? app.getSelfPath('navigation.position.value') : null
+    if (!pos || typeof pos.latitude !== 'number') throw new Error('no GPS position; cannot start route')
+    routeTarget = { lat, lon }
+    routeStart = { lat: pos.latitude, lon: pos.longitude }
+    emitNav()                                                    // prime the nav data before engaging
+    send(util.format(CMD.state, now(), srcAddr, ccuAddr, '0D')) // engage nav-follow
+    if (routeTimer) clearInterval(routeTimer)
+    routeTimer = setInterval(emitNav, NAV_MS)
+    return 'goto ' + lat.toFixed(5) + ',' + lon.toFixed(5)
+  }
+  function gotoStop () {
+    if (routeTimer) { clearInterval(routeTimer); routeTimer = null }
+    routeTarget = null
+    send(util.format(CMD.state, now(), srcAddr, ccuAddr, STATE_CODE.standby))
+    return 'route stopped'
+  }
+
   // PUT endpoints so Node-RED / the API can drive the rudder (no autopilot engagement).
   //   steering.autopilot.rudder.jog     ('port'|'starboard')  -> one bounded NFU nudge (~2 deg)
   //   steering.autopilot.rudder.center  (any value)           -> closed-loop auto-center
@@ -472,7 +554,22 @@ module.exports = function (app) {
         return { state: 'COMPLETED', statusCode: 200, message: 'pattern ' + name + (p.sel ? ' ' + (dir === '00' ? 'stbd' : 'port') : '') }
       } catch (e) { return { state: 'COMPLETED', statusCode: 502, message: e.message } }
     })
-    app.debug('rudder PUT handlers registered (jog, center, stop, rawstate)')
+    // Route follow from our side. value = "<lat>,<lon>" or { latitude, longitude }.
+    //   steering.autopilot.route.goto  -> generate nav data toward the waypoint + engage nav-follow
+    //   steering.autopilot.route.stop  -> stop generating + standby
+    app.registerPutHandler('vessels.self', 'steering.autopilot.route.goto', (ctx, path, value, cb) => {
+      try {
+        const v = (value && value.value !== undefined) ? value.value : value
+        let lat, lon
+        if (v && typeof v === 'object') { lat = v.latitude; lon = v.longitude } else { const p = String(v).split(','); lat = parseFloat(p[0]); lon = parseFloat(p[1]) }
+        if (!isFinite(lat) || !isFinite(lon)) throw new Error('need "latitude,longitude"')
+        return { state: 'COMPLETED', statusCode: 200, message: gotoStart(lat, lon) }
+      } catch (e) { return { state: 'COMPLETED', statusCode: 502, message: e.message } }
+    })
+    app.registerPutHandler('vessels.self', 'steering.autopilot.route.stop', (ctx, path, value, cb) => {
+      return { state: 'COMPLETED', statusCode: 200, message: gotoStop() }
+    })
+    app.debug('PUT handlers registered (rudder jog/center/stop/rawstate, pattern, route goto/stop)')
   }
 
   // ---- helpers ----
