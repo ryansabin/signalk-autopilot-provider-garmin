@@ -101,6 +101,9 @@ const CMD_MODE = {
   // 0x06 hard-turn, 0x13 tack/gybe, 0x15 rudder-test intentionally omitted (transient; they
   // must not overwrite the underlying hold mode)
 }
+// Target-adjust steps: 10 17 04 04 26 <code>. Degrees per press (low bit = step size, high
+// bit = sign). Watched on the bus so head-unit adjustments move the tracked target too.
+const ADJUST_DELTA = { 0x00: -1, 0x01: -10, 0x02: 1, 0x03: 10 }
 // The CCU broadcasts engaged/wind markers continuously at ~24 Hz while engaged, so a tight
 // window with a low threshold tracks the true state within ~1 s and drops to standby promptly.
 // (The old 3 s window + "stay engaged on 1 marker" hysteresis lagged badly — it falsely held
@@ -193,19 +196,9 @@ module.exports = function (app) {
     const code = HEADING_CODE[step]
     if (code === undefined) throw new Error('Cannot map adjustment to a Garmin step')
     send(util.format(CMD.heading, now(), srcAddr, ccuAddr, code))
-    // advance whichever target is active by the quantized step actually commanded
-    const stepRad = parseInt(step, 10) * Math.PI / 180
-    if (status.state === 'wind' && trackedWind !== null) {
-      // a +course step turns the boat to starboard, which moves the signed wind
-      // angle negative (more port) — opposite sign to the heading target. Matches GHC.
-      trackedWind -= stepRad
-      while (trackedWind > Math.PI) trackedWind -= 2 * Math.PI
-      while (trackedWind < -Math.PI) trackedWind += 2 * Math.PI
-    } else if (trackedTarget !== null) {
-      trackedTarget += stepRad
-      while (trackedTarget < 0) trackedTarget += 2 * Math.PI
-      while (trackedTarget >= 2 * Math.PI) trackedTarget -= 2 * Math.PI
-    }
+    // The tracked target is advanced when this command is observed back on the bus (see
+    // onReassembled's 26-adjust watch), which also covers head-unit adjustments — so we don't
+    // advance it locally here, to avoid double-counting our own command.
   }
 
   pilot.setTarget = () => { throw new Error('setTarget not implemented (no known Garmin absolute-heading PGN); use adjustTarget') }
@@ -322,15 +315,35 @@ module.exports = function (app) {
   }
 
   function onReassembled (src, dst, bytes) {
-    // Mode-set command watch — from ANY controller (GHC src 5, chartplotter src 4, or us),
-    // directed to the CCU. Frame: 10 17 04 04 05 0A 00 <code>. Latest wins = current mode.
-    for (let i = 0; i + 7 < bytes.length; i++) {
-      if (bytes[i] === STATECMD[0] && bytes[i + 1] === STATECMD[1] && bytes[i + 2] === STATECMD[2] &&
-          bytes[i + 3] === STATECMD[3] && bytes[i + 4] === STATECMD[4] && bytes[i + 5] === STATECMD[5] &&
-          bytes[i + 6] === STATECMD[6]) {
+    // Watch commands from ANY controller (GHC src 5, chartplotter src 4, or us), directed to the
+    // CCU, in the 10 17 04 04 container:
+    //   05 0A 00 <code>  mode set  -> current mode (+ seed the target baseline on a transition)
+    //   26 <code>        target adjust (+-1/+-10 deg step) -> advance desired heading / wind angle
+    // Reading the adjust from the bus means head-unit changes move the tracked target too, not
+    // just our own API commands.
+    for (let i = 0; i + 5 < bytes.length; i++) {
+      if (bytes[i] !== 0x10 || bytes[i + 1] !== 0x17 || bytes[i + 2] !== 0x04 || bytes[i + 3] !== 0x04) continue
+      if (bytes[i + 4] === 0x05 && bytes[i + 5] === 0x0A && bytes[i + 6] === 0x00 && i + 7 < bytes.length) {
         const m = CMD_MODE[bytes[i + 7]]
-        if (m !== undefined) lastCmdMode = m
-        break
+        if (m !== undefined) {
+          if (m !== lastCmdMode) {                                  // mode transition: seed baseline
+            if (m === 'auto') { trackedTarget = lastHeading; trackedWind = null }
+            else if (m === 'wind') { trackedWind = lastApparentWind; trackedTarget = null }
+            else if (m === 'standby') { trackedTarget = null; trackedWind = null }
+          }
+          lastCmdMode = m
+        }
+      } else if (bytes[i + 4] === 0x26 && ADJUST_DELTA[bytes[i + 5]] !== undefined) {
+        const stepRad = ADJUST_DELTA[bytes[i + 5]] * Math.PI / 180
+        if (lastCmdMode === 'wind' && trackedWind !== null) {       // wind step is opposite sign (GHC)
+          trackedWind -= stepRad
+          while (trackedWind > Math.PI) trackedWind -= 2 * Math.PI
+          while (trackedWind < -Math.PI) trackedWind += 2 * Math.PI
+        } else if (trackedTarget !== null) {
+          trackedTarget += stepRad
+          while (trackedTarget < 0) trackedTarget += 2 * Math.PI
+          while (trackedTarget >= 2 * Math.PI) trackedTarget -= 2 * Math.PI
+        }
       }
     }
     // CCU status broadcast only: engaged markers + wind-tracking field (used for the
@@ -381,6 +394,9 @@ module.exports = function (app) {
       engaged = true
       if (lastCmdMode && lastCmdMode !== 'standby') state = lastCmdMode
       else state = (windHits >= WIND_MIN) ? 'wind' : 'auto'
+      // Seed a baseline if we came up already engaged (missed the engage command after a restart).
+      if (state === 'auto' && trackedTarget === null && lastHeading !== null) trackedTarget = lastHeading
+      else if (state === 'wind' && trackedWind === null && lastApparentWind !== null) trackedWind = lastApparentWind
       target = (state === 'wind') ? trackedWind : trackedTarget
     } else {
       engaged = false; state = 'standby'
