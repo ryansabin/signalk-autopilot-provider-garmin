@@ -9,11 +9,12 @@ status stream structurally decoded for the first time._
 | N2K source | Device | Role |
 |---|---|---|
 | 2 | Reactor 40 CCU | Autopilot computer — **receives commands**, **broadcasts status** |
-| 4 | GHC head | control head / nav display |
-| 5 | GHC head | control head — **active controller** during this session |
+| 4 | GPSMAP chartplotter | nav display — **sends the route/Go-To command (`0D`)** + nav PGNs 129284/129283/127258 |
+| 5 | GHC head | control head — **active controller; sends the hold-mode commands** (`02`/`05`/`11`) |
 | 0 | wind instrument | wind data (130306) |
-| 3 | GPS / chartplotter | position, COG/SOG, nav data |
+| 3 | GPS | position, COG/SOG |
 | 6, 7 | GHC heads / displays | inter-display sync |
+| 101 | SignalK (this plugin) | injects commands via canboatjs; also a registered controller (keepalive) |
 
 All autopilot traffic is **PGN 126720**, Garmin proprietary fast-packet, payload prefix
 `E5 98` = manufacturer code 229 (Garmin) + Marine industry. Inside that, the autopilot
@@ -168,21 +169,60 @@ byte 6 = field id, byte 7 = type/length selector. Values are little-endian ints/
 (heading, rudder, gains, wind angle, etc.). There are also two other message types from the CCU:
 `6C 07 02 02 ...` (low-rate summary) and head broadcasts `E7 08 0A 0A ...`.
 
-### Mode is encoded structurally — reliable discriminators found
+### Engaged vs standby (from CCU status) — reliable
 
-- **Wind mode** → the CCU emits a dedicated field `00 0B`:
-  `E5 98 10 17 04 04 00 0B 00 <LE float>`, value ≈ `3F 95…` = ~1.16 rad ≈ **67° apparent wind angle being held**.
-  This field is **absent** in standby/heading. Presence ⇒ wind mode; value ⇒ target wind angle.
-  Verified: 159–160 frames in wind, 0 in standby (confirmed live on disengage → 0).
-- **Engaged vs standby** → the `6C 07 02 02 01 00` summary carries two LE floats; the second reads
-  ≈ **35.0 in standby → 38.5 when engaged**. Engaged-only fields `00 A2`, `02 9E`, `02 74` also appear.
+The CCU broadcasts engaged-markers `00 A2` / `02 74` / `00 72` at ~2 Hz **only while engaged**.
+The provider counts them in a **3 s** window (≥2 ⇒ engaged); absence ⇒ standby. A tighter 1.3 s
+window flapped between marker bursts (route↔standby every few seconds) and was widened.
 
-### Still to confirm (next session, boat stationary)
+The wind-tracking field `00 0B` (`E5 98 10 17 04 04 00 0B 00 <LE float>`, the held apparent-wind
+angle in radians) is present in **wind hold AND route follow**, absent in heading hold / standby.
+It supplies the wind-angle value and serves as a fallback mode hint before the first command is seen.
 
-Dock swing drifts heading/wind, which jitters the telemetry bytes and confounds a clean per-byte
-diff. A controlled standby→heading→wind→standby cycle with continuous capture will (a) lock down the
-mode readback, and (b) map the remaining field-ids to heading / rudder angle / target heading so the
-plugin can publish full `steering.autopilot.*` (state, target.headingMagnetic, target.windAngleApparent).
+### Reading the live AP mode — SOLVED (2026-06-21, verified live)
+
+**The CCU never broadcasts its discrete steering mode.** A full PGN inventory of the CCU
+(src 2) shows only 126720, 127245 (rudder), 127250 (heading), 127251 (rate of turn),
+127257 (attitude), 61184 (sporadic proprietary), 60928 (address claim). The standard
+mode-bearing PGN **127237 (Heading/Track Control) is not sent**. Inside 126720, a controlled
+standby→heading→wind→route capture (route loaded the whole time) found **no field that
+separates wind hold from route follow** — see the corrected note below.
+
+**The mode is on the bus as the mode-set COMMANDS, not as status.** Every mode change is an
+explicit command to the CCU (the boat forces a standby→engage for each change), so the latest
+command *is* the current mode:
+
+`E5 98 10 17 04 04 05 0A 00 <code>`
+
+| code | mode | sent by |
+|---|---|---|
+| `02` | standby | GHC (src 5) |
+| `05` | heading / auto | GHC (src 5) |
+| `11` | wind | GHC (src 5) |
+| `0D` | route / nav | **chartplotter (src 4)** |
+| `08/09/0A/0B/0E/0F/10` | patterns | whoever engages |
+
+Captured live from src 5: `05 0A 00 02 / 11 / 05`. The provider now watches these frames from
+**any** source and takes the latest as the mode, gated by the engaged-markers above for the
+engaged/standby ground truth. Verified live across a full `auto → wind → standby → route → wind`
+cycle with a route loaded throughout — every mode reads correctly, no flapping. This resolves the
+old "can't tell pattern/wind/heading apart" gap.
+
+### Corrected: what `00 0B` and `0E 02` actually mean
+
+An earlier version of this doc claimed `00 0B` presence ⇒ wind mode, and (briefly) `0E 02` ≠
+sentinel `71 17` ⇒ route. **Both are wrong on a sailboat with nav active.** `00 0B` streams in
+wind **and** route (it is the apparent-wind angle the system tracks/displays, absent only in pure
+heading hold). `0E 02` (and the plotter's 129284 / 129283, which *are* on the bus — an earlier
+"no nav PGNs" claim was a hex typo, 129284 = `0x1F904`) track **a route being loaded on the
+plotter**, which persists in every AP mode until you cancel nav on the plotter — so they flag
+"route loaded," not "AP steering the route." Mode must come from the command stream above.
+
+### Still to map (future)
+
+Remaining 126720 status field-ids (heading, rudder angle, target heading) are live LE int/float
+values; mapping them would let the plugin publish full `target.headingMagnetic` /
+`target.windAngleApparent`. Not required for state/mode, which the command stream now covers.
 
 ## Rudder NFU jog + auto-center — NEW (2026-06-20, verified live)
 
@@ -218,6 +258,9 @@ Node-RED autopilot dashboard (CENTER RUDDER / JOG PORT / JOG STBD).
 - `apre.py` — fast-packet reassembler + `catalog`/`diff`
 - `apcap.sh` — per-button capture+diff helper
 - `status*.py` — status-stream field analyzers
+- `modecap.py` / `combine6.py` — per-mode 126720 property tables + 6-way diff (the wind-vs-route study)
+- `pgnsrc.py` — per-source PGN inventory (confirmed 127237 absent; found 129284 from src 4)
+- `cmddump.py` — dumps AP-container commands from non-CCU sources (captured the `05 0A 00 <code>` mode-sets)
 
 ## Contribution plan
 
