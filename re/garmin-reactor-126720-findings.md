@@ -35,17 +35,25 @@ pattern codes were confirmed in power-displacement vessel mode on 2026-06-21):
 | Mode | code | Notes |
 |---|---|---|
 | Standby (disengage) | `02` | clutch released |
-| Heading hold (auto) | `05` | |
+| Heading hold | `05` | clutch engages, display "Heading Hold" |
+| Heading hold (2nd code) | `06` | also engages heading hold — verified by hand; the blind probe had wrongly tagged it inert |
 | Wind hold | `11` | sailboat; CCU then broadcasts wind-target field `00 0B` |
+| **Autopilot Setup Mode** | `07` | display "Autopilot in Setup Mode"; drives the rudder briefly (commissioning state), not a runtime steering mode |
 | Steering-test drive | `15` | engages drive and drives the rudder (see rudder section) |
 | **Circles pattern** | `08` | preceded by selector `04 34 00 <dir>` |
 | **Zigzag pattern** | `09` | no direction selector (single engage) |
 | **Williamson turn** | `0A` | preceded by selector `04 47 00 <dir>` |
 | **U-turn pattern** | `0B` | preceded by selector `04 6F 00 <dir>` |
-| (engages, unidentified) | `07` | engages but no pattern selector — possibly nav/route follow; TBD |
 
-Codes `00,01,03,04,06` and `0C`–`1F` were probed and are inert/standby. After any
-engage, the active head emits a status ack `E5 98 10 17 04 04 25 02 00`.
+Codes `00,01,03,04` are inert (free wheel, no display change) and `0C`–`1F` read as
+standby. After any engage, the active head emits a status ack `E5 98 10 17 04 04 25 02 00`.
+
+> **Method note (2026-06-21):** codes `01`–`07` were verified live in power-displacement
+> vessel mode by sending each through canboatjs and confirming by hand (clutch feel) + GHC
+> display. This is the reliable method — the earlier read-only state-code probe mislabeled
+> several codes (e.g. `06` and `07` looked inert in the telemetry but actually engage). The
+> pilot was de-commissioned during these tests (compass-cal + speed-source alerts), so
+> engaged modes pull the clutch but the steering interlock blocks active steering.
 
 > ⚠️ Probing unknown state codes blind once drove the rudder into a stall and tripped a
 > latched drive fault (cleared by an AP power-cycle). Don't fuzz state codes near the stops.
