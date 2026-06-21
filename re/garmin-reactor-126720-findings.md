@@ -87,9 +87,11 @@ The `00 1F` amplitude is the same float-field family as the wind target `00 0B`.
 heading-adjust key press (`26 00`/`26 02`, ∓1°) **cancels the pattern and reverts to
 heading hold** at the adjusted heading. Standby (`05 0A 00 02`) also exits.
 
-**Heading-hold steering keys:** engaged in plain heading hold, the left/right arrows send
-only `26 00` (−1°) / `26 02` (+1°) — desired-heading selection, *not* direct rudder control.
-Confirmed live on the bus (no rudder command appears).
+**Steering keys (heading & wind hold):** the left/right arrows send only `26 00` (−1°) /
+`26 02` (+1°) — desired-target selection, *not* direct rudder control. The **same** `26`
+command is used in both modes; the CCU interprets it by context — desired **heading** in
+heading hold, desired **wind angle** in wind hold (verified live underway, both modes). Only
+±1 appears (no `26 01`/`26 03` ±10) when the head shows just the two arrows.
 
 GPS-based patterns (orbit / cloverleaf / search) require active navigation to a waypoint
 (Go To / Route To) and follow-route — not yet captured.
