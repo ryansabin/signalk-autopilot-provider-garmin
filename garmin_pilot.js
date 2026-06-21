@@ -76,8 +76,9 @@ const PATTERNS = {
 
 const AP_OPTIONS = {
   states: [
-    { name: 'auto', engaged: true },
-    { name: 'wind', engaged: true },
+    { name: 'auto', engaged: true },     // compass heading hold
+    { name: 'wind', engaged: true },     // apparent wind hold
+    { name: 'route', engaged: true },    // nav / route follow (observed only; engaged from the plotter)
     { name: 'standby', engaged: false }
   ],
   modes: []
@@ -86,6 +87,14 @@ const AP_OPTIONS = {
 // Status-decode tuning
 const WIND_FID = [0x00, 0x0B]
 const ENGAGED_FIDS = [[0x00, 0xA2], [0x02, 0x74], [0x00, 0x72]]
+// Route/nav-follow flag. The CCU property 0E 02 holds the sentinel 71 17 whenever there is no
+// active route, and a real (non-sentinel) value once it is following a Go-To / route. Verified
+// live: identical 71 17 across standby, heading hold AND wind hold; flips to a live value (01 04
+// observed) only under route-follow. This is what tells route apart from wind hold, since both
+// stream the 00 0B wind-tracking field.
+const ROUTE_FID = [0x0E, 0x02]
+const ROUTE_SENTINEL = [0x71, 0x17]
+const ROUTE_WINDOW_MS = 3000   // 0E 02 arrives ~1.5 Hz; use a wider window than the marker fields
 // The CCU broadcasts engaged/wind markers continuously at ~24 Hz while engaged, so a tight
 // window with a low threshold tracks the true state within ~1 s and drops to standby promptly.
 // (The old 3 s window + "stay engaged on 1 marker" hysteresis lagged badly — it falsely held
@@ -114,9 +123,7 @@ module.exports = function (app) {
   let lastApparentWind = null    // radians (signed +-pi), apparent wind angle from PGN 130306
   let trackedTarget = null       // radians, target heading tracked locally in auto mode
   let trackedWind = null         // radians (signed +-pi), desired wind angle tracked in wind mode
-  let commandedState = null      // last engagement we commanded (auto/wind/standby). The CCU's
-                                 // bus markers can't reveal the sub-mode, so this is our only
-                                 // honest source for it; null = engaged but sub-mode unknown.
+  let routeActiveAt = 0          // last time the CCU's 0E 02 property showed an active route (ms)
   let evalTimer = null
   let kaTimer = null
   let candump = null
@@ -162,7 +169,6 @@ module.exports = function (app) {
     send(util.format(CMD.state, now(), srcAddr, ccuAddr, code))
     status.state = value
     status.engaged = (value !== 'standby')
-    commandedState = value
     // Locally track the target (the CCU doesn't broadcast it decodably).
     if (value === 'auto') { trackedTarget = lastHeading; trackedWind = null }            // hold current heading
     else if (value === 'wind') { trackedWind = lastApparentWind; trackedTarget = null }  // hold current apparent wind angle
@@ -310,17 +316,24 @@ module.exports = function (app) {
 
   function onReassembled (src, dst, bytes) {
     if (String(src) !== String(ccuAddr) || dst !== 255) return
-    const idx = findMarker(bytes)
-    if (idx === -1 || idx + 5 >= bytes.length) return
-    const fhi = bytes[idx + 4]
-    const flo = bytes[idx + 5]
-    const k = fhi + ':' + flo
-    const arr = seen.get(k) || []
-    arr.push(Date.now())
-    seen.set(k, arr)
-    if (fhi === WIND_FID[0] && flo === WIND_FID[1] && idx + 10 < bytes.length) {
-      const f = readFloatLE(bytes, idx + 7)
-      if (f !== null && isFinite(f) && Math.abs(f) < 7) lastWindAngle = f
+    const ts = Date.now()
+    // A single 126720 message can pack several "10 17 04 04 <fhi> <flo> ..." properties;
+    // scan them all so we don't miss low-rate fields like the 0E 02 route flag.
+    for (let idx = 0; idx + 5 < bytes.length; idx++) {
+      if (bytes[idx] !== 0x10 || bytes[idx + 1] !== 0x17 || bytes[idx + 2] !== 0x04 || bytes[idx + 3] !== 0x04) continue
+      const fhi = bytes[idx + 4]
+      const flo = bytes[idx + 5]
+      const k = fhi + ':' + flo
+      const arr = seen.get(k) || []
+      arr.push(ts)
+      seen.set(k, arr)
+      if (fhi === WIND_FID[0] && flo === WIND_FID[1] && idx + 10 < bytes.length) {
+        const f = readFloatLE(bytes, idx + 7)
+        if (f !== null && isFinite(f) && Math.abs(f) < 7) lastWindAngle = f
+      } else if (fhi === ROUTE_FID[0] && flo === ROUTE_FID[1] && idx + 8 < bytes.length) {
+        // 0E 02 = 71 17 when no active route; any other value => following a route/Go-To.
+        if (!(bytes[idx + 7] === ROUTE_SENTINEL[0] && bytes[idx + 8] === ROUTE_SENTINEL[1])) routeActiveAt = ts
+      }
     }
   }
 
@@ -343,25 +356,35 @@ module.exports = function (app) {
     }
     let engHits = 0
     ENGAGED_FIDS.forEach((f) => { engHits += cnt(f[0] + ':' + f[1], ENGAGED_WINDOW_MS) })
+    const windHits = cnt(WIND_FID[0] + ':' + WIND_FID[1], WIND_WINDOW_MS)
+    const routeActive = (t - routeActiveAt) <= ROUTE_WINDOW_MS
 
     let state, engaged, target = null
     if (engHits >= ENGAGED_MIN) {
-      // The CCU broadcasts the engaged markers in EVERY engaged sub-mode (heading hold, wind
-      // hold, nav-follow, patterns) and on a sailboat streams apparent wind (00 0B) constantly,
-      // so neither distinguishes the sub-mode. Trust only what we last commanded; if the CCU was
-      // engaged from the GHC/chartplotter we cannot read the sub-mode (see #41), so report a
-      // neutral 'auto' (engaged) rather than guessing 'wind'.
+      // Engaged. The CCU does NOT broadcast its discrete sub-mode, so we infer it from the
+      // two signals it does expose (all verified live):
+      //   00 0B wind-tracking field : present in wind hold AND route-follow, absent in heading
+      //   0E 02 != sentinel 71 17   : a route is LOADED on the plotter (not necessarily steered)
+      // => no wind field            -> heading hold ('auto')
+      //    wind field + route loaded -> route-follow ('route')
+      //    wind field + no route     -> wind hold ('wind')
+      // Caveat: wind hold with a route left loaded on the plotter reads as 'route' — the bus
+      // gives nothing to tell those two apart (see findings / #41).
       engaged = true
-      state = (commandedState && commandedState !== 'standby') ? commandedState : 'auto'
-      target = (state === 'wind') ? trackedWind : trackedTarget
+      if (windHits >= WIND_MIN) {
+        state = routeActive ? 'route' : 'wind'
+        target = routeActive ? trackedTarget : trackedWind
+      } else {
+        state = 'auto'; target = trackedTarget
+      }
     } else {
-      engaged = false; state = 'standby'; commandedState = null
+      engaged = false; state = 'standby'
     }
     // trackedTarget/trackedWind lifecycle is driven by setState/adjustTarget (commands), not by
     // the detected state, so the engage transient doesn't wipe it.
 
     const changed = state !== status.state
-    if (changed) app.debug('Garmin AP state -> %s (eng=%d commanded=%s)', state, engHits, commandedState)
+    if (changed) app.debug('Garmin AP state -> %s (eng=%d wind=%d route=%s)', state, engHits, windHits, routeActive)
     // mode is intentionally null: SignalK splits state (engagement) from mode (steering
     // sub-mode), but the Reactor exposes everything through state and we define no separate
     // modes, so publishing mode would only duplicate state.
@@ -521,7 +544,6 @@ module.exports = function (app) {
     routeStart = { lat: pos.latitude, lon: pos.longitude }
     emitNav()                                                    // prime the nav data before engaging
     send(util.format(CMD.state, now(), srcAddr, ccuAddr, '0D')) // engage nav-follow
-    commandedState = 'auto'                                      // engaged (route); not 'wind'
     if (routeTimer) clearInterval(routeTimer)
     routeTimer = setInterval(emitNav, NAV_MS)
     return 'goto ' + lat.toFixed(5) + ',' + lon.toFixed(5)
@@ -530,7 +552,6 @@ module.exports = function (app) {
     if (routeTimer) { clearInterval(routeTimer); routeTimer = null }
     routeTarget = null
     send(util.format(CMD.state, now(), srcAddr, ccuAddr, STATE_CODE.standby))
-    commandedState = 'standby'
     return 'route stopped'
   }
 
@@ -543,7 +564,6 @@ module.exports = function (app) {
     const dir = (dirS === 'stbd' || dirS === 'starboard' || dirS === '0' || dirS === '00') ? '00' : '01'
     if (p.sel) send(util.format(PAT_SEL, now(), srcAddr, ccuAddr, p.sel, dir))
     send(util.format(CMD.state, now(), srcAddr, ccuAddr, p.code))
-    commandedState = 'auto'   // pattern/maneuver engages the CCU; report engaged (not 'wind')
     return 'pattern ' + name + (p.sel ? ' ' + (dir === '00' ? 'stbd' : 'port') : '')
   }
 
