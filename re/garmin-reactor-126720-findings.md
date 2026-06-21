@@ -61,16 +61,38 @@ standby. After any engage, the active head emits a status ack `E5 98 10 17 04 04
 ### STEERING PATTERNS (powerboat / power-displacement mode)
 
 Each pattern = a **selector** frame then the **engage** state frame, sent together; the
-`<dir>` byte (`00`/`01`) is the Port/Starboard choice offered on the head.
+`<dir>` byte (`00`/`01`) is the Port/Starboard choice offered on the head. Verified live
+2026-06-21 on a calibrated pilot (patterns actually steer once the unit is commissioned).
 
-| Pattern | Selector frame | Engage frame |
-|---|---|---|
-| Zigzag | (none) | `E5 98 10 17 04 04 05 0A 00 09` |
-| Circles | `E5 98 10 17 04 04 04 34 00 <dir>` | `... 05 0A 00 08` |
-| U-turn | `E5 98 10 17 04 04 04 6F 00 <dir>` | `... 05 0A 00 0B` |
-| Williamson turn | `E5 98 10 17 04 04 04 47 00 <dir>` | `... 05 0A 00 0A` |
+| Pattern | Selector frame | Engage frame | Parameters |
+|---|---|---|---|
+| Zigzag | (none) | `... 05 0A 00 09` | amplitude + period (below) |
+| Circles | `... 04 34 00 <dir>` | `... 05 0A 00 08` | time (below) |
+| U-turn | `... 04 6F 00 <dir>` | `... 05 0A 00 0B` | none — direction only |
+| Williamson turn | `... 04 47 00 <dir>` | `... 05 0A 00 0A` | none — direction only |
 
-GPS-based patterns (orbit / cloverleaf / search) and follow-route not yet captured.
+(all frames prefixed `E5 98 10 17 04 04`)
+
+**Pattern parameters** (set as their own frames before/while configuring):
+
+| Parameter | Frame | Encoding | Captured |
+|---|---|---|---|
+| Zigzag amplitude | `... 00 1F 00 <float32 LE>` | radians (float) | `F3 66 DF 3E` ≈ 0.436 rad ≈ 25° |
+| Zigzag period | `... 05 20 00 <u16 LE>` | **seconds** | `3C 00` = 60 s = 1 min |
+| Circles time | `... 05 33 00 <u16 LE>` | **seconds** | `F0 00` = 240 s = 4 min |
+
+The `00 1F` amplitude is the same float-field family as the wind target `00 0B`.
+
+**Pattern cancel behaviour (verified repeatedly):** while *any* pattern is engaged, a
+heading-adjust key press (`26 00`/`26 02`, ∓1°) **cancels the pattern and reverts to
+heading hold** at the adjusted heading. Standby (`05 0A 00 02`) also exits.
+
+**Heading-hold steering keys:** engaged in plain heading hold, the left/right arrows send
+only `26 00` (−1°) / `26 02` (+1°) — desired-heading selection, *not* direct rudder control.
+Confirmed live on the bus (no rudder command appears).
+
+GPS-based patterns (orbit / cloverleaf / search) require active navigation to a waypoint
+(Go To / Route To) and follow-route — not yet captured.
 
 ### POWERBOAT RUDDER STEERING — `E5 98 10 17 04 04 04 2A 00 <dir>`
 
