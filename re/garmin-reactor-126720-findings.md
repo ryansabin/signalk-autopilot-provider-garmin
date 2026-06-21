@@ -37,7 +37,8 @@ pattern codes were confirmed in power-displacement vessel mode on 2026-06-21):
 | Standby (disengage) | `02` | clutch released |
 | Heading hold | `05` | clutch engages, display "Heading Hold" |
 | Hard-turn / constant-rudder | `06` | **At the dock** it looks like heading hold (clutch in, "Heading Hold" shown). **Underway it pins the rudder hard over (~−27°) and circles the boat continuously** — NOT heading hold. Identity TBD (constant-rudder turn mode). |
-| Wind hold | `11` | sailboat; CCU then broadcasts wind-target field `00 0B` |
+| Wind hold (apparent) | `11` | sailboat; CCU then broadcasts wind-target field `00 0B`. Only **apparent** wind hold exists on this boat — no separate true-wind code (true wind needs a boat-speed source). |
+| **Tack / Gybe** | `13` | sailing maneuver from wind/heading hold; preceded by selector `04 A2 00 <dir>` (`dir` = turn direction). Tack and gybe send the **same** command — the CCU decides which from the wind geometry. |
 | **Autopilot Setup Mode** | `07` | display "Autopilot in Setup Mode"; drives the rudder briefly (commissioning state), not a runtime steering mode |
 | Steering-test drive | `15` | engages drive and drives the rudder (see rudder section) |
 | **Circles pattern** | `08` | preceded by selector `04 34 00 <dir>` |
