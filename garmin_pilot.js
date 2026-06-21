@@ -67,7 +67,11 @@ const PATTERNS = {
   // GPS patterns — require active navigation (a Go-To / route) on the chartplotter
   orbit:      { sel: '5B', code: '0F' },
   cloverleaf: { sel: '3E', code: '0E' },
-  search:     { sel: '65', code: '10' }
+  search:     { sel: '65', code: '10' },
+  // Sailing maneuvers (from wind/heading hold). Tack and gybe are the SAME wire command;
+  // the CCU decides tack vs gybe from the wind geometry. dir = turn direction.
+  tack:       { sel: 'A2', code: '13' },
+  gybe:       { sel: 'A2', code: '13' }
 }
 
 const AP_OPTIONS = {
@@ -110,6 +114,9 @@ module.exports = function (app) {
   let lastApparentWind = null    // radians (signed +-pi), apparent wind angle from PGN 130306
   let trackedTarget = null       // radians, target heading tracked locally in auto mode
   let trackedWind = null         // radians (signed +-pi), desired wind angle tracked in wind mode
+  let commandedState = null      // last engagement we commanded (auto/wind/standby). The CCU's
+                                 // bus markers can't reveal the sub-mode, so this is our only
+                                 // honest source for it; null = engaged but sub-mode unknown.
   let evalTimer = null
   let kaTimer = null
   let candump = null
@@ -155,6 +162,7 @@ module.exports = function (app) {
     send(util.format(CMD.state, now(), srcAddr, ccuAddr, code))
     status.state = value
     status.engaged = (value !== 'standby')
+    commandedState = value
     // Locally track the target (the CCU doesn't broadcast it decodably).
     if (value === 'auto') { trackedTarget = lastHeading; trackedWind = null }            // hold current heading
     else if (value === 'wind') { trackedWind = lastApparentWind; trackedTarget = null }  // hold current apparent wind angle
@@ -188,8 +196,8 @@ module.exports = function (app) {
   }
 
   pilot.setTarget = () => { throw new Error('setTarget not implemented (no known Garmin absolute-heading PGN); use adjustTarget') }
-  pilot.tack = () => { throw new Error('tack not implemented yet (Garmin wind-mode tack TBD)') }
-  pilot.gybe = () => { throw new Error('gybe not implemented for Garmin Reactor') }
+  pilot.tack = (direction) => engagePattern('tack', direction || 'starboard')
+  pilot.gybe = (direction) => engagePattern('gybe', direction || 'starboard')
   pilot.dodge = () => { throw new Error('dodge not implemented for Garmin Reactor') }
 
   // ---- Discovery + config schema ----
@@ -321,9 +329,9 @@ module.exports = function (app) {
     // same engaged markers as heading-hold. Don't let that flip the reported mode to
     // 'auto' — we are not holding a heading. Report standby for the duration.
     if (inTest || Date.now() < testCooldownUntil) {
-      status.state = 'standby'; status.mode = 'standby'; status.engaged = false; status.target = null
+      status.state = 'standby'; status.mode = null; status.engaged = false; status.target = null
       if (typeof app.autopilotUpdate === 'function') {
-        try { app.autopilotUpdate(apType, { state: 'standby', mode: 'standby', engaged: false, target: null }) } catch (e) {}
+        try { app.autopilotUpdate(apType, { state: 'standby', mode: null, engaged: false, target: null }) } catch (e) {}
       }
       return
     }
@@ -333,29 +341,33 @@ module.exports = function (app) {
       seen.set(k, arr)
       return arr.length
     }
-    const windHits = cnt(WIND_FID[0] + ':' + WIND_FID[1], WIND_WINDOW_MS)
     let engHits = 0
     ENGAGED_FIDS.forEach((f) => { engHits += cnt(f[0] + ':' + f[1], ENGAGED_WINDOW_MS) })
 
-    let state, mode, engaged, target = null
-    if (windHits >= WIND_MIN) {
-      state = 'wind'; mode = 'wind'; engaged = true; target = trackedWind
-    } else if (engHits >= ENGAGED_MIN) {
-      // engaged whenever the CCU is currently broadcasting the engaged markers (tight window).
-      // NOTE: heading hold, nav-follow and the steering patterns all share these markers, so
-      // this reports engaged/standby reliably but does not distinguish those sub-modes.
-      state = 'auto'; mode = 'auto'; engaged = true; target = trackedTarget
+    let state, engaged, target = null
+    if (engHits >= ENGAGED_MIN) {
+      // The CCU broadcasts the engaged markers in EVERY engaged sub-mode (heading hold, wind
+      // hold, nav-follow, patterns) and on a sailboat streams apparent wind (00 0B) constantly,
+      // so neither distinguishes the sub-mode. Trust only what we last commanded; if the CCU was
+      // engaged from the GHC/chartplotter we cannot read the sub-mode (see #41), so report a
+      // neutral 'auto' (engaged) rather than guessing 'wind'.
+      engaged = true
+      state = (commandedState && commandedState !== 'standby') ? commandedState : 'auto'
+      target = (state === 'wind') ? trackedWind : trackedTarget
     } else {
-      state = 'standby'; mode = 'standby'; engaged = false
+      engaged = false; state = 'standby'; commandedState = null
     }
-    // trackedTarget lifecycle is driven by setState/adjustTarget (commands), not by
+    // trackedTarget/trackedWind lifecycle is driven by setState/adjustTarget (commands), not by
     // the detected state, so the engage transient doesn't wipe it.
 
     const changed = state !== status.state
-    if (changed) app.debug('Garmin AP state -> %s (wind=%d eng=%d)', state, windHits, engHits)
-    status.state = state; status.mode = mode; status.engaged = engaged; status.target = target
+    if (changed) app.debug('Garmin AP state -> %s (eng=%d commanded=%s)', state, engHits, commandedState)
+    // mode is intentionally null: SignalK splits state (engagement) from mode (steering
+    // sub-mode), but the Reactor exposes everything through state and we define no separate
+    // modes, so publishing mode would only duplicate state.
+    status.state = state; status.mode = null; status.engaged = engaged; status.target = target
     if (typeof app.autopilotUpdate === 'function') {
-      try { app.autopilotUpdate(apType, { state, mode, engaged, target }) } catch (e) { if (changed) app.debug('autopilotUpdate failed: ' + e.message) }
+      try { app.autopilotUpdate(apType, { state, mode: null, engaged, target }) } catch (e) { if (changed) app.debug('autopilotUpdate failed: ' + e.message) }
     }
   }
 
@@ -509,6 +521,7 @@ module.exports = function (app) {
     routeStart = { lat: pos.latitude, lon: pos.longitude }
     emitNav()                                                    // prime the nav data before engaging
     send(util.format(CMD.state, now(), srcAddr, ccuAddr, '0D')) // engage nav-follow
+    commandedState = 'auto'                                      // engaged (route); not 'wind'
     if (routeTimer) clearInterval(routeTimer)
     routeTimer = setInterval(emitNav, NAV_MS)
     return 'goto ' + lat.toFixed(5) + ',' + lon.toFixed(5)
@@ -517,7 +530,21 @@ module.exports = function (app) {
     if (routeTimer) { clearInterval(routeTimer); routeTimer = null }
     routeTarget = null
     send(util.format(CMD.state, now(), srcAddr, ccuAddr, STATE_CODE.standby))
+    commandedState = 'standby'
     return 'route stopped'
+  }
+
+  // Engage a steering pattern / maneuver by name (+ direction). Sends the selector frame
+  // (if any) then the engage state. GPS patterns need an active route; sailing maneuvers
+  // need wind/heading hold engaged first.
+  function engagePattern (name, dirS) {
+    const p = PATTERNS[name]
+    if (!p) throw new Error('unknown pattern: ' + name)
+    const dir = (dirS === 'stbd' || dirS === 'starboard' || dirS === '0' || dirS === '00') ? '00' : '01'
+    if (p.sel) send(util.format(PAT_SEL, now(), srcAddr, ccuAddr, p.sel, dir))
+    send(util.format(CMD.state, now(), srcAddr, ccuAddr, p.code))
+    commandedState = 'auto'   // pattern/maneuver engages the CCU; report engaged (not 'wind')
+    return 'pattern ' + name + (p.sel ? ' ' + (dir === '00' ? 'stbd' : 'port') : '')
   }
 
   // PUT endpoints so Node-RED / the API can drive the rudder (no autopilot engagement).
@@ -550,12 +577,7 @@ module.exports = function (app) {
       try {
         const v = ('' + ((value && value.value) || value)).trim()
         const [name, dirS] = v.split(':')
-        const p = PATTERNS[name]
-        if (!p) throw new Error('unknown pattern: ' + name)
-        const dir = (dirS === 'stbd' || dirS === 'starboard' || dirS === '0' || dirS === '00') ? '00' : '01'
-        if (p.sel) send(util.format(PAT_SEL, now(), srcAddr, ccuAddr, p.sel, dir))
-        send(util.format(CMD.state, now(), srcAddr, ccuAddr, p.code))
-        return { state: 'COMPLETED', statusCode: 200, message: 'pattern ' + name + (p.sel ? ' ' + (dir === '00' ? 'stbd' : 'port') : '') }
+        return { state: 'COMPLETED', statusCode: 200, message: engagePattern(name, dirS) }
       } catch (e) { return { state: 'COMPLETED', statusCode: 502, message: e.message } }
     })
     // Route follow from our side. value = "<lat>,<lon>" or { latitude, longitude }.
