@@ -101,13 +101,22 @@ These need an active Go-To / route on the chartplotter. Captured live underway 2
 |---|---|---|
 | Nav / Go-To follow | `... 05 0A 00 0D` | **sent by the chartplotter (src 04)**, not the GHC. `0D` reads inert if there is no active waypoint — that's why the dock probe saw nothing. |
 | Orbit | `... 04 5B 00 <dir>` + `... 05 0A 00 0F` | port/stbd |
-| Cloverleaf | `... 04 3E 00 <dir>` + `... 05 0A 00 0E` | port/stbd; has a length option |
+| Cloverleaf | `... 04 3E 00 <dir>` + `... 05 0A 00 0E` | port/stbd; length param `00 3D` (below) |
 | Search | (not yet captured) | has a spacing option |
 
-**GPS-pattern parameters do not appear on the autopilot bus.** Cloverleaf length and search
-spacing are computed by the **chartplotter**, which owns the waypoint geometry and just feeds
-the CCU a course to steer — so unlike the powerboat-pattern params (amplitude/period/time,
-which the CCU computes), they are never sent as 126720 commands.
+**The autopilot runs the GPS pattern, not the chartplotter.** Confirmed live: after engaging
+cloverleaf, *stopping navigation on the chartplotter left the pattern running* — the Reactor
+holds the waypoint and the geometry itself; the plotter only seeds the initial waypoint.
+
+So the pattern parameters ARE sent to the CCU, as float fields (same family as `00 0B` wind
+target / `00 1F` zigzag amplitude), in **SI meters** (the Garmin UI shows feet):
+
+| Parameter | Frame | Captured |
+|---|---|---|
+| Cloverleaf length | `... 00 3D 00 <float32 LE>` | `67 66 98 43` = 304.8 m = **1000 ft** |
+
+(An earlier note here wrongly claimed these params stay in the chartplotter — they don't; the
+mistake was scanning for the integer `1000` instead of the float `304.8 m`.)
 
 **Direction-key (`26`) rule (general, verified):** heading hold and wind hold *adjust the
 target* (heading / wind angle) and stay engaged; in **every other engaged mode** — all
