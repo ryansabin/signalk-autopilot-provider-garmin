@@ -102,7 +102,7 @@ These need an active Go-To / route on the chartplotter. Captured live underway 2
 | Nav / Go-To follow | `... 05 0A 00 0D` | **sent by the chartplotter (src 04)**, not the GHC. `0D` reads inert if there is no active waypoint — that's why the dock probe saw nothing. |
 | Orbit | `... 04 5B 00 <dir>` + `... 05 0A 00 0F` | port/stbd |
 | Cloverleaf | `... 04 3E 00 <dir>` + `... 05 0A 00 0E` | port/stbd; length param `00 3D` (below) |
-| Search | (not yet captured) | has a spacing option |
+| Search | `... 04 65 00 <dir>` + `... 05 0A 00 10` | port/stbd; spacing param `00 66` (below) |
 
 **The autopilot runs the GPS pattern, not the chartplotter.** Confirmed live: after engaging
 cloverleaf, *stopping navigation on the chartplotter left the pattern running* — the Reactor
@@ -114,6 +114,7 @@ target / `00 1F` zigzag amplitude), in **SI meters** (the Garmin UI shows feet):
 | Parameter | Frame | Captured |
 |---|---|---|
 | Cloverleaf length | `... 00 3D 00 <float32 LE>` | `67 66 98 43` = 304.8 m = **1000 ft** |
+| Search spacing | `... 00 66 00 <float32 LE>` | `0A D7 73 42` = 60.96 m = **200 ft** |
 
 (An earlier note here wrongly claimed these params stay in the chartplotter — they don't; the
 mistake was scanning for the integer `1000` instead of the float `304.8 m`.)
