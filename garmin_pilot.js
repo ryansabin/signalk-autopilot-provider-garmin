@@ -99,8 +99,9 @@ const ROUTE_WINDOW_MS = 3000   // 0E 02 arrives ~1.5 Hz; use a wider window than
 // window with a low threshold tracks the true state within ~1 s and drops to standby promptly.
 // (The old 3 s window + "stay engaged on 1 marker" hysteresis lagged badly — it falsely held
 // engaged for seconds after a real standby. Removed.)
-const WIND_WINDOW_MS = 1300
-const ENGAGED_WINDOW_MS = 1300
+const WIND_WINDOW_MS = 2500
+const ENGAGED_WINDOW_MS = 3000   // engaged markers arrive ~2/s but bursty; a 1.3 s window dipped
+                                 // below threshold between bursts and flapped engaged->standby.
 const WIND_MIN = 3
 const ENGAGED_MIN = 2     // markers in the window to report engaged (no hysteresis)
 const EVAL_MS = 400
