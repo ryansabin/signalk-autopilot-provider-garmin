@@ -40,6 +40,22 @@ const STATE_CODE = { auto: '05', standby: '02', wind: '11' }
 const KEEPALIVE = '%s,7,126720,%s,%s,0C,E5,98,10,17,04,04,15,03,02,00,C8,00'
 const KEEPALIVE_MS = 500
 
+// Rudder NFU jog / auto-center via the CCU's steering-test drive mode.
+// Captured from the GHC steering-direction test (src5 -> CCU2):
+//   enter test mode (engages drive/clutch): 05 0A 00 15   (a STATE command, new code 15)
+//   jog rudder one step:                     04 15 00 <dir>   dir 00 / 01 = the two directions
+//   exit test mode -> standby:               05 0A 00 02
+// Sent through canboatjs ('nmea2000out') like every other command, because the CCU
+// only honours these from SignalK's registered N2K device (raw cansend is ignored).
+// enter/exit reuse CMD.state (codes 15 / 02); only the jog needs its own template.
+const JOG = '%s,7,126720,%s,%s,0A,E5,98,10,17,04,04,04,15,00,%s,FF,FF,FF,FF,FF,FF'
+const TEST_STATE_CODE = '15'                       // state code -> manual steering-test drive mode
+const JOG_CODE = { port: '01', starboard: '00' }   // wire codes (verified live: 00 -> +ve/stbd, 01 -> -ve/port)
+const CENTER_TOL_DEG = 2.0                          // stop when |rudder| <= this (~1 jog step ~1.8deg)
+const JOG_PULSE_MS = 150                            // spacing between jog frames
+const JOG_MAX_PULSES = 80                           // safety cap on one centering run
+const TEST_WATCHDOG_MS = 6000                       // auto-exit test mode if jogging goes idle
+
 const AP_OPTIONS = {
   states: [
     { name: 'auto', engaged: true },
@@ -80,6 +96,10 @@ module.exports = function (app) {
   let evalTimer = null
   let kaTimer = null
   let candump = null
+  let inTest = false          // rudder steering-test (NFU) drive mode is active
+  let testWatchdog = null     // auto-exits test mode if jogging goes idle
+  let centering = false       // a centerRudder() run is in progress
+  let testCooldownUntil = 0   // ignore engaged-markers until this time (drive disengage lag)
   const asm = {}              // fast-packet reassembly: key -> { len, bytes }
 
   const pilot = { id: null, type: apType }
@@ -94,11 +114,14 @@ module.exports = function (app) {
     startCanReader()
     evalTimer = setInterval(evaluate, EVAL_MS)
     if (registerController) kaTimer = setInterval(() => { app.emit('nmea2000out', util.format(KEEPALIVE, now(), srcAddr, ccuAddr)) }, KEEPALIVE_MS)
+    registerPutHandlers()
   }
 
   pilot.stop = () => {
     if (evalTimer) { clearInterval(evalTimer); evalTimer = null }
     if (kaTimer) { clearInterval(kaTimer); kaTimer = null }
+    if (testWatchdog) { clearTimeout(testWatchdog); testWatchdog = null }
+    if (inTest) { try { exitTest() } catch (e) {} }
     if (candump) { try { candump.kill() } catch (e) {} candump = null }
   }
 
@@ -278,6 +301,16 @@ module.exports = function (app) {
   }
 
   function evaluate () {
+    // While the rudder test-drive (NFU jog / auto-center) is active, the CCU emits the
+    // same engaged markers as heading-hold. Don't let that flip the reported mode to
+    // 'auto' — we are not holding a heading. Report standby for the duration.
+    if (inTest || Date.now() < testCooldownUntil) {
+      status.state = 'standby'; status.mode = 'standby'; status.engaged = false; status.target = null
+      if (typeof app.autopilotUpdate === 'function') {
+        try { app.autopilotUpdate(apType, { state: 'standby', mode: 'standby', engaged: false, target: null }) } catch (e) {}
+      }
+      return
+    }
     const t = Date.now()
     const cnt = (k, win) => {
       const arr = (seen.get(k) || []).filter((ts) => t - ts <= win)
@@ -307,6 +340,107 @@ module.exports = function (app) {
     if (typeof app.autopilotUpdate === 'function') {
       try { app.autopilotUpdate(apType, { state, mode, engaged, target }) } catch (e) { if (changed) app.debug('autopilotUpdate failed: ' + e.message) }
     }
+  }
+
+  // ---- Rudder jog / auto-center (EXPERIMENTAL — drives the rudder) ----
+  // steering.rudderAngle is published to SignalK from the bus; read it back as feedback.
+  function rudderDeg () {
+    const v = (typeof app.getSelfPath === 'function') ? app.getSelfPath('steering.rudderAngle.value') : null
+    return (typeof v === 'number' && isFinite(v)) ? v * 180 / Math.PI : null
+  }
+  function armWatchdog () {
+    if (testWatchdog) clearTimeout(testWatchdog)
+    testWatchdog = setTimeout(() => { app.debug('rudder test watchdog -> exiting test mode'); exitTest() }, TEST_WATCHDOG_MS)
+  }
+  function enterTest () {
+    send(util.format(CMD.state, now(), srcAddr, ccuAddr, TEST_STATE_CODE))
+    inTest = true
+    armWatchdog()
+  }
+  function exitTest () {
+    if (testWatchdog) { clearTimeout(testWatchdog); testWatchdog = null }
+    send(util.format(CMD.state, now(), srcAddr, ccuAddr, STATE_CODE.standby))
+    inTest = false
+    testCooldownUntil = Date.now() + 3500   // suppress lingering engaged-markers while the drive disengages
+  }
+  function jogPulse (code) {
+    send(util.format(JOG, now(), srcAddr, ccuAddr, code))
+    armWatchdog()
+  }
+  function sleep (ms) { return new Promise((r) => setTimeout(r, ms)) }
+
+  // Manual NFU step: one small jog in the requested direction (enters test mode if needed).
+  async function rudderJog (dir) {
+    const code = JOG_CODE[dir]
+    if (code === undefined) throw new Error("jog dir must be 'port' or 'starboard'")
+    if (!inTest) { enterTest(); await sleep(500) }
+    jogPulse(code)
+    return 'jogged ' + dir
+  }
+
+  // Closed-loop auto-center using live steering.rudderAngle feedback.
+  async function centerRudder () {
+    if (centering) { app.debug('centerRudder already running'); return 'busy' }
+    if (rudderDeg() === null) throw new Error('no steering.rudderAngle feedback; cannot auto-center')
+    centering = true
+    let result = 'maxpulses'
+    try {
+      enterTest()
+      await sleep(600)
+      const startSign = Math.sign(rudderDeg() || 0)
+      let code = null
+      let prev = rudderDeg()
+      for (let i = 0; i < JOG_MAX_PULSES; i++) {
+        const cur = rudderDeg()
+        if (cur === null) { result = 'no-feedback'; break }
+        if (Math.abs(cur) <= CENTER_TOL_DEG) { result = 'centered'; break }
+        // crossed center (sign flipped vs start) => within one step of zero, good enough
+        if (startSign !== 0 && Math.sign(cur) !== startSign) { result = 'centered'; break }
+        // drive toward zero: +angle needs port, -angle needs starboard
+        if (code === null) code = (cur > 0) ? JOG_CODE.port : JOG_CODE.starboard
+        jogPulse(code)
+        await sleep(JOG_PULSE_MS)
+        const after = rudderDeg()
+        // safety self-correct: if |angle| grew, we're driving the wrong way -> flip
+        if (after !== null && prev !== null && Math.abs(after) > Math.abs(prev) + 0.3) {
+          code = (code === JOG_CODE.port) ? JOG_CODE.starboard : JOG_CODE.port
+          app.debug('center: |angle| grew %s->%s, flipping dir to %s', prev.toFixed(1), after.toFixed(1), code)
+        }
+        prev = after
+      }
+    } finally {
+      exitTest()
+      centering = false
+    }
+    const end = rudderDeg()
+    app.debug('centerRudder done: %s at %s deg', result, (end === null ? '?' : end.toFixed(1)))
+    return result + (end === null ? '' : ' @' + end.toFixed(1) + 'deg')
+  }
+
+  // PUT endpoints so Node-RED / the API can drive the rudder.
+  //   steering.autopilot.rudder.center  (any value)         -> auto-center
+  //   steering.autopilot.rudder.jog     ('port'|'starboard')-> one NFU step
+  //   steering.autopilot.rudder.stop    (any value)         -> exit test mode now
+  function registerPutHandlers () {
+    if (typeof app.registerPutHandler !== 'function') { app.debug('registerPutHandler unavailable; rudder PUT control disabled'); return }
+    app.registerPutHandler('vessels.self', 'steering.autopilot.rudder.center', (ctx, path, value, cb) => {
+      centerRudder()
+        .then((r) => cb({ state: 'COMPLETED', statusCode: 200, message: String(r) }))
+        .catch((e) => cb({ state: 'COMPLETED', statusCode: 502, message: e.message }))
+      return { state: 'PENDING' }
+    })
+    app.registerPutHandler('vessels.self', 'steering.autopilot.rudder.jog', (ctx, path, value, cb) => {
+      const dir = (typeof value === 'string') ? value : (value && value.dir)
+      rudderJog(dir)
+        .then((r) => cb({ state: 'COMPLETED', statusCode: 200, message: String(r) }))
+        .catch((e) => cb({ state: 'COMPLETED', statusCode: 502, message: e.message }))
+      return { state: 'PENDING' }
+    })
+    app.registerPutHandler('vessels.self', 'steering.autopilot.rudder.stop', (ctx, path, value, cb) => {
+      exitTest()
+      return { state: 'COMPLETED', statusCode: 200, message: 'test mode exited' }
+    })
+    app.debug('rudder PUT handlers registered (center, jog, stop)')
   }
 
   // ---- helpers ----
