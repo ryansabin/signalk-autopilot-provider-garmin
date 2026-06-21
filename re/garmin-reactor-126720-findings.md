@@ -93,8 +93,25 @@ command is used in both modes; the CCU interprets it by context — desired **he
 heading hold, desired **wind angle** in wind hold (verified live underway, both modes). Only
 ±1 appears (no `26 01`/`26 03` ±10) when the head shows just the two arrows.
 
-GPS-based patterns (orbit / cloverleaf / search) require active navigation to a waypoint
-(Go To / Route To) and follow-route — not yet captured.
+### GPS / NAV STEERING (requires an active waypoint)
+
+These need an active Go-To / route on the chartplotter. Captured live underway 2026-06-21:
+
+| Mode | Frames | Notes |
+|---|---|---|
+| Nav / Go-To follow | `... 05 0A 00 0D` | **sent by the chartplotter (src 04)**, not the GHC. `0D` reads inert if there is no active waypoint — that's why the dock probe saw nothing. |
+| Orbit | `... 04 5B 00 <dir>` + `... 05 0A 00 0F` | port/stbd |
+| Cloverleaf | `... 04 3E 00 <dir>` + `... 05 0A 00 0E` | port/stbd; has a length option |
+| Search | (not yet captured) | has a spacing option |
+
+**GPS-pattern parameters do not appear on the autopilot bus.** Cloverleaf length and search
+spacing are computed by the **chartplotter**, which owns the waypoint geometry and just feeds
+the CCU a course to steer — so unlike the powerboat-pattern params (amplitude/period/time,
+which the CCU computes), they are never sent as 126720 commands.
+
+**Direction-key (`26`) rule (general, verified):** heading hold and wind hold *adjust the
+target* (heading / wind angle) and stay engaged; in **every other engaged mode** — all
+patterns *and* nav/Go-To follow — a `26` key press **cancels to heading hold**.
 
 **Underway verification (2026-06-21, open water, calibrated pilot, helm manned).** Every
 engage command was driven through the plugin and confirmed by the boat's behaviour:
