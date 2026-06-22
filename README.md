@@ -9,7 +9,7 @@ CCU's broadcast of the same PGN back into live `state` / `engaged` / `target`.
 
 > Status: **working, verified live underway** on a Reactor 40. Garmin's autopilot runs entirely
 > over PGN 126720, which had not been publicly decoded — the command **and** status protocols here
-> were reverse-engineered from live bus captures. See [`re/garmin-reactor-126720-findings.md`](re/garmin-reactor-126720-findings.md)
+> were reverse-engineered from live bus captures. See [`garmin-reactor-126720-findings.md`](garmin-reactor-126720-findings.md)
 > for the full writeup.
 
 ## Hardware (reference vessel: *Buttercup*)
