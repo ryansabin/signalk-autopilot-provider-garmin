@@ -49,8 +49,16 @@ because the CCU does not broadcast the target either.
 ## API
 
 Standard Signal K **v2** autopilot endpoints (`/signalk/v2/api/vessels/self/autopilots/garminReactor/…`):
-`state` (auto/wind/standby), `target/adjust`, `engage` / `disengage`, `tack/{port|starboard}`,
-`gybe/{port|starboard}`.
+`state` (auto / wind / route / standby), `target/adjust`, `engage` / `disengage`,
+`tack/{port|starboard}`, `gybe/{port|starboard}`, and `courseCurrentPoint` (engages nav-follow toward
+the active waypoint). `courseNextPoint`, `setTarget` and `dodge` are implemented as throwing stubs —
+the Reactor advances waypoints at the chartplotter and has no absolute-target / dodge PGN.
+
+The provider also publishes an **`actions`** list (`tack`, `gybe`, `courseCurrentPoint`, …) with
+`available` flags that track the current state, so clients like Freeboard can show only what's usable.
+
+> Note: this provider exposes everything through `state`; `mode` is always `null`. Clients should read
+> `state`, not `mode`.
 
 Garmin-specific operations the v2 standard doesn't cover are exposed as **v1 PUT** paths:
 - `steering.autopilot.rudder.pattern` — value `"<name>:<dir>"`, e.g. `circles:stbd`, `uturn:port`,
@@ -79,6 +87,14 @@ Commands must be sent through the Signal K server's NMEA 2000 output (canboatjs)
   126720 broadcasts, the bus mode-set / target-adjust command watch, and the v1 PUT handlers for
   patterns + route.
 
+## Requirements
+- **Linux host with SocketCAN** (e.g. a Raspberry Pi with a CAN HAT) — the status RX path shells out
+  to **`candump`**, which must be on `PATH`, on the interface the CCU is on (default `can0`).
+- A **Signal K server with NMEA 2000 output** (canboatjs) — commands are sent via `nmea2000out`; the
+  CCU ignores raw `cansend`.
+- **Signal K server ≥ 2.x** with the Autopilot API (developed/tested on server 2.28, `@signalk/server-api`
+  with the `courseCurrentPoint` / `actions` additions). Node ≥ 18.
+
 ## Install
 ```
 cd ~/.signalk/node_modules        # or your server's plugin dir
@@ -86,8 +102,12 @@ npm install signalk-autopilot-provider-garmin
 # or symlink a checkout for development
 ```
 Enable in the Signal K plugin config; the CCU address is auto-discovered (override available).
-A Node-RED **Dashboard 2.0** control page is included in the reference setup (modes, target adjust,
-tack/gybe, patterns, live status).
+A Node-RED **Dashboard 2.0** control page is included under [`nodered/`](nodered/) (modes, target
+adjust, tack/gybe, patterns, live status).
+
+> **`registerController` keepalive:** the plugin broadcasts a GHC-style controller keepalive so the CCU
+> accepts heading-adjust commands. If a physical GHC head is already on the bus, consider disabling
+> this option (plugin config) to avoid controller-arbitration conflicts.
 
 ## Known limitations
 - **Target / mode are inferred, not read.** The CCU doesn't broadcast them. `state` is exact (from the

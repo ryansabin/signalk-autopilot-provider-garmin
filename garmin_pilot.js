@@ -31,7 +31,7 @@ const CMD = {
   state:   '%s,7,126720,%s,%s,0B,E5,98,10,17,04,04,05,0A,00,%s,00,FF,FF'
 }
 const HEADING_CODE = { '1': '02', '10': '03', '15': '03', '-1': '00', '-10': '01', '-15': '01' }
-const STATE_CODE = { auto: '05', standby: '02', wind: '11' }
+const STATE_CODE = { auto: '05', standby: '02', wind: '11', route: '0D' }
 
 // Controller-registration keepalive. The GHC heads broadcast this ~2 Hz to the
 // CCU; without it the Reactor treats us as an unregistered sender and faults to
@@ -99,12 +99,14 @@ const ENGAGED_WINDOW_MS = 3000   // engaged markers arrive ~2/s but bursty; a 1.
 const WIND_MIN = 3
 const ENGAGED_MIN = 2     // markers in the window to report engaged (no hysteresis)
 const EVAL_MS = 400
+const OFFLINE_MS = 5000   // no traffic from the CCU for this long => report state 'off-line'
+const ASM_TTL_MS = 1500   // drop incomplete fast-packet reassembly buffers older than this
 
 const util = require('util')
 const { spawn } = require('child_process')
 
 module.exports = function (app) {
-  const status = { state: null, mode: null, engaged: null, target: null }
+  const status = { state: null, mode: null, engaged: null, target: null, actions: [] }
 
   let srcAddr = '3'
   let ccuAddr = '2'      // Reactor CCU N2K source address (discovered or configured)
@@ -113,7 +115,9 @@ module.exports = function (app) {
   let discovered = false
 
   const seen = new Map()      // 'hi:lo' -> [timestamps ms]
-  let lastWindAngle = null
+  let lastCcuRx = 0              // ms of the last frame seen from the CCU (for off-line detection)
+  let wasOffline = false         // last reported off-line state, for status-message edge detection
+  let lastActionsKey = ''        // signature of the last actions array pushed (dedupe deltas)
   let lastHeading = null         // radians, vessel heading from PGN 127250 (CCU)
   let lastApparentWind = null    // radians (signed +-pi), apparent wind angle from PGN 130306
   let trackedTarget = null       // radians, target heading tracked locally in auto mode
@@ -132,12 +136,40 @@ module.exports = function (app) {
     ccuAddr = props.ccuAddr || ccuAddr
     canInterface = props.canInterface || canInterface
     if (props.registerController !== undefined) registerController = props.registerController
+    if (props.ccuAddr) discovered = true   // explicit config wins; skip auto-discovery
+    discover()                             // resolve the CCU N2K address before we start
     app.debug('Garmin Reactor provider start. srcAddr=%s ccuAddr=%s if=%s register=%s', srcAddr, ccuAddr, canInterface, registerController)
+    setStatus('Starting; reading ' + canInterface + (discovered ? ', CCU at addr ' + ccuAddr : ''))
     startCanReader()
     evalTimer = setInterval(evaluate, EVAL_MS)
     if (registerController) kaTimer = setInterval(() => { app.emit('nmea2000out', util.format(KEEPALIVE, now(), srcAddr, ccuAddr)) }, KEEPALIVE_MS)
     registerPutHandlers()
   }
+
+  // Resolve the CCU N2K address by matching 'Reactor' in NMEA 2000 Product Info. Runs once at
+  // start() (not from the schema getter, which must stay side-effect free).
+  function discover () {
+    if (discovered) { pilot.id = ccuAddr; return }
+    const sources = app.getPath('/sources')
+    if (sources) {
+      Object.values(sources).forEach((bus) => {
+        if (!bus || typeof bus !== 'object') return
+        Object.keys(bus).forEach((addr) => {
+          const n2k = bus[addr] && bus[addr].n2k
+          if (!n2k) return
+          const hay = [n2k.hardwareVersion, n2k.modelId, n2k.productName].filter((x) => typeof x === 'string').join(' ')
+          if (hay.indexOf(AP_DISCOVERY_TEXT) !== -1) {
+            ccuAddr = String(addr); discovered = true
+            app.debug('Discovered Garmin Reactor CCU at N2K addr ' + ccuAddr)
+          }
+        })
+      })
+    }
+    pilot.id = ccuAddr
+  }
+
+  function setStatus (msg) { if (typeof app.setPluginStatus === 'function') app.setPluginStatus(msg) }
+  function setError (msg) { if (typeof app.setPluginError === 'function') app.setPluginError(msg) }
 
   pilot.stop = () => {
     if (evalTimer) { clearInterval(evalTimer); evalTimer = null }
@@ -151,25 +183,32 @@ module.exports = function (app) {
     mode: status.mode,
     engaged: status.engaged,
     target: status.target,
-    options: AP_OPTIONS
+    options: AP_OPTIONS,
+    actions: status.actions || []
   })
 
   pilot.setState = (value) => {
     const code = STATE_CODE[value]
-    if (code === undefined) throw new Error('Unsupported state: ' + value + ' (known: auto, standby, wind)')
+    if (code === undefined) throw new Error('Unsupported state: ' + value + ' (known: auto, wind, route, standby)')
     send(util.format(CMD.state, now(), srcAddr, ccuAddr, code))
     status.state = value
     status.engaged = (value !== 'standby')
     // Locally track the target (the CCU doesn't broadcast it decodably).
     if (value === 'auto') { trackedTarget = lastHeading; trackedWind = null }            // hold current heading
     else if (value === 'wind') { trackedWind = lastApparentWind; trackedTarget = null }  // hold current apparent wind angle
-    else { trackedTarget = null; trackedWind = null }                                    // standby
+    else { trackedTarget = null; trackedWind = null }                                    // standby / route (no local target)
     return status.engaged
   }
 
   pilot.engage = () => pilot.setState('auto')
   pilot.disengage = () => pilot.setState('standby')
   pilot.setMode = (mode) => pilot.setState(mode)
+
+  // Course API hooks. courseCurrentPoint engages nav-follow toward the active waypoint (route
+  // mode). Advancing to the next waypoint is owned by the chartplotter on the Reactor and can't
+  // be commanded from Signal K, so courseNextPoint throws (per the provider contract).
+  pilot.courseCurrentPoint = () => { pilot.setState('route'); return 'engaged nav-follow (active waypoint)' }
+  pilot.courseNextPoint = () => { throw new Error('advancing to the next waypoint is controlled from the chartplotter on Garmin Reactor') }
 
   pilot.adjustTarget = (value) => {
     if (!status.engaged) app.debug('adjustTarget while not engaged; sending anyway')
@@ -190,39 +229,16 @@ module.exports = function (app) {
   pilot.gybe = (direction) => engagePattern('gybe', maneuverDir('gybe') || direction)
   pilot.dodge = () => { throw new Error('dodge not implemented for Garmin Reactor') }
 
-  // ---- Discovery + config schema ----
-  pilot.properties = () => {
-    if (!discovered) {
-      const sources = app.getPath('/sources')
-      if (sources) {
-        Object.values(sources).forEach((bus) => {
-          if (bus && typeof bus === 'object') {
-            Object.keys(bus).forEach((addr) => {
-              const n2k = bus[addr] && bus[addr].n2k
-              if (!n2k) return
-              const hay = [n2k.hardwareVersion, n2k.modelId, n2k.productName]
-                .filter((x) => typeof x === 'string').join(' ')
-              if (hay.indexOf(AP_DISCOVERY_TEXT) !== -1) {
-                ccuAddr = String(addr); discovered = true
-                app.debug('Discovered Garmin Reactor CCU at N2K addr ' + ccuAddr)
-              }
-            })
-          }
-        })
-      }
+  // ---- Config schema (pure; no side effects — discovery happens in start()) ----
+  pilot.properties = () => ({
+    type: 'object',
+    properties: {
+      ccuAddr: { type: 'string', title: 'Garmin Reactor CCU NMEA2000 address', description: 'Leave blank to auto-discover (matches "Reactor" in Product Info).', default: ccuAddr || '2' },
+      srcAddr: { type: 'string', title: 'Source address this plugin transmits from', description: 'Use a free N2K address.', default: srcAddr },
+      canInterface: { type: 'string', title: 'CAN interface to read for status', description: 'socketcan interface the CCU is on (read directly via candump).', default: canInterface },
+      registerController: { type: 'boolean', title: 'Register as a controller (keepalive)', description: 'Broadcast the GHC controller keepalive so the CCU accepts heading-adjust commands. Disable if a physical GHC head is on the bus to avoid controller arbitration conflicts.', default: true }
     }
-    const desc = discovered ? 'Discovered Reactor CCU at N2K address ' + ccuAddr
-      : 'Reactor not auto-discovered; set the CCU address manually.'
-    pilot.id = ccuAddr
-    return {
-      properties: {
-        ccuAddr: { type: 'string', title: 'Garmin Reactor CCU NMEA2000 address', description: desc, default: ccuAddr || '2' },
-        srcAddr: { type: 'string', title: 'Source address this plugin transmits from', description: 'Use a free N2K address.', default: srcAddr },
-        canInterface: { type: 'string', title: 'CAN interface to read for status', description: 'socketcan interface the CCU is on (read directly via candump).', default: canInterface },
-        registerController: { type: 'boolean', title: 'Register as a controller (keepalive)', description: 'Broadcast the GHC controller keepalive so the CCU accepts heading-adjust commands. Required for heading nudges.', default: true }
-      }
-    }
-  }
+  })
 
   // ---- Status RX: read can0 directly, reassemble fast-packets, decode ----
   function startCanReader () {
@@ -263,6 +279,7 @@ module.exports = function (app) {
     const dp = (canId >> 24) & 1
     let pgn, dst
     if (pf < 240) { pgn = (dp << 16) | (pf << 8); dst = ps } else { pgn = (dp << 16) | (pf << 8) | ps; dst = 255 }
+    if (String(sa) === String(ccuAddr)) lastCcuRx = Date.now()   // CCU liveness for off-line detection
     // PGN 127250 Vessel Heading (single frame): byte0=SID, bytes1-2 = heading u16 * 1e-4 rad
     if (pgn === 127250) {
       if (String(sa) === String(ccuAddr) && data.length >= 3) {
@@ -286,7 +303,7 @@ module.exports = function (app) {
     const frame = data[0] & 0x1f
     const key = sa + ':' + seqhi
     if (frame === 0) {
-      asm[key] = { len: data[1], bytes: data.slice(2) }
+      asm[key] = { len: data[1], bytes: data.slice(2), ts: Date.now() }
     } else if (asm[key]) {
       asm[key].bytes = asm[key].bytes.concat(data.slice(1))
     }
@@ -342,15 +359,24 @@ module.exports = function (app) {
       const arr = seen.get(k) || []
       arr.push(ts)
       seen.set(k, arr)
-      if (fhi === WIND_FID[0] && flo === WIND_FID[1] && idx + 10 < bytes.length) {
-        const f = readFloatLE(bytes, idx + 7)
-        if (f !== null && isFinite(f) && Math.abs(f) < 7) lastWindAngle = f
-      }
+      // (We only need the PRESENCE/rate of WIND_FID + engaged markers, counted via `seen`.
+      // The CCU's 00 0B float value is the measured apparent wind, which we already get from
+      // PGN 130306, so it isn't decoded here.)
     }
   }
 
   function evaluate () {
     const t = Date.now()
+    for (const k in asm) { if (t - (asm[k].ts || 0) > ASM_TTL_MS) delete asm[k] }   // drop stale fast-packets
+
+    // Off-line: candump not running, or no frame heard from the CCU within OFFLINE_MS.
+    if (candump === null || lastCcuRx === 0 || (t - lastCcuRx) > OFFLINE_MS) {
+      if (!wasOffline) { wasOffline = true; setError('Reactor CCU not responding on ' + canInterface) }
+      publish('off-line', false, null)
+      return
+    }
+    if (wasOffline) { wasOffline = false; setStatus('Connected to Reactor CCU' + (ccuAddr ? ' at addr ' + ccuAddr : '')) }
+
     const cnt = (k, win) => {
       const arr = (seen.get(k) || []).filter((ts) => t - ts <= win)
       seen.set(k, arr)
@@ -375,17 +401,36 @@ module.exports = function (app) {
     } else {
       engaged = false; state = 'standby'
     }
-    // trackedTarget/trackedWind lifecycle is driven by setState/adjustTarget (commands), not by
-    // the detected state, so the engage transient doesn't wipe it.
+    publish(state, engaged, target)
+  }
 
+  // Action-availability the server advertises to clients (Freeboard etc.) via apInfo.actions.
+  // Only the standard action ids are valid (dodge/tack/gybe/courseCurrentPoint/courseNextPoint);
+  // the Garmin steering patterns aren't standard actions and stay on the custom PUT path.
+  function buildActions (state, engaged) {
+    const online = state !== 'off-line'
+    const windKnown = lastApparentWind !== null && isFinite(lastApparentWind)
+    const sailing = engaged && (state === 'wind' || state === 'auto')
+    return [
+      { id: 'tack', name: 'Tack', available: online && sailing && windKnown },
+      { id: 'gybe', name: 'Gybe', available: online && sailing && windKnown },
+      { id: 'courseCurrentPoint', name: 'Follow active waypoint', available: online },
+      { id: 'courseNextPoint', name: 'Advance to next waypoint', available: false },
+      { id: 'dodge', name: 'Dodge', available: false }
+    ]
+  }
+
+  function publish (state, engaged, target) {
+    const actions = buildActions(state, engaged)
+    const actionsKey = actions.map((a) => a.id + (a.available ? '1' : '0')).join(',')
     const changed = state !== status.state
-    if (changed) app.debug('Garmin AP state -> %s (eng=%d cmd=%s wind=%d)', state, engHits, lastCmdMode, windHits)
-    // mode is intentionally null: SignalK splits state (engagement) from mode (steering
-    // sub-mode), but the Reactor exposes everything through state and we define no separate
-    // modes, so publishing mode would only duplicate state.
-    status.state = state; status.mode = null; status.engaged = engaged; status.target = target
+    if (changed) app.debug('Garmin AP state -> %s (engaged=%s)', state, engaged)
+    // mode stays null: the Reactor exposes everything through state; we define no separate modes.
+    status.state = state; status.mode = null; status.engaged = engaged; status.target = target; status.actions = actions
     if (typeof app.autopilotUpdate === 'function') {
-      try { app.autopilotUpdate(apType, { state, mode: null, engaged, target }) } catch (e) { if (changed) app.debug('autopilotUpdate failed: ' + e.message) }
+      const upd = { state, mode: null, engaged, target }
+      if (actionsKey !== lastActionsKey) { upd.actions = actions; lastActionsKey = actionsKey }   // only on change
+      try { app.autopilotUpdate(apType, upd) } catch (e) { if (changed) app.debug('autopilotUpdate failed: ' + e.message) }
     }
   }
 
@@ -543,16 +588,6 @@ module.exports = function (app) {
   function quantizeStep (deg) {
     const sz = Math.abs(deg) >= 6 ? 10 : 1
     return (deg < 0 ? '-' : '') + sz
-  }
-  function findMarker (b) {
-    for (let i = 0; i + 3 < b.length; i++) {
-      if (b[i] === 0x10 && b[i + 1] === 0x17 && b[i + 2] === 0x04 && b[i + 3] === 0x04) return i
-    }
-    return -1
-  }
-  function readFloatLE (b, off) {
-    if (off + 3 >= b.length) return null
-    return Buffer.from([b[off], b[off + 1], b[off + 2], b[off + 3]]).readFloatLE(0)
   }
 
   return pilot

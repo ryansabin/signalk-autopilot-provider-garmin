@@ -1,8 +1,14 @@
 {
   "name": "signalk-autopilot-provider-garmin",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Signal K v2 Autopilot Provider for Garmin Reactor autopilots (NMEA 2000, proprietary PGN 126720)",
   "main": "index.js",
+  "signalk": {
+    "displayName": "Garmin Reactor Autopilot Provider"
+  },
+  "engines": {
+    "node": ">=18"
+  },
   "files": [
     "index.js",
     "garmin_pilot.js",

@@ -32,6 +32,10 @@ module.exports = function (app) {
 
   plugin.stop = () => {
     autopilot.stop()
+    // Best-effort de-registration. The plugin-facing AutopilotProviderRegistry in current
+    // server-api doesn't expose an unregister, so this is a no-op there; re-registration on the
+    // next start() overwrites the entry keyed by plugin id, so duplicates aren't created.
+    try { if (typeof app.unregisterAutopilotProvider === 'function') app.unregisterAutopilotProvider(plugin.id) } catch (e) { /* ignore */ }
   }
 
   plugin.schema = autopilot.properties
@@ -53,7 +57,9 @@ module.exports = function (app) {
           disengage:    async (deviceId) => autopilot.disengage(),
           tack:         async (direction, deviceId) => autopilot.tack(direction),
           gybe:         async (direction, deviceId) => autopilot.gybe(direction),
-          dodge:        async (value, deviceId) => autopilot.dodge(value)
+          dodge:        async (value, deviceId) => autopilot.dodge(value),
+          courseCurrentPoint: async (deviceId) => autopilot.courseCurrentPoint(),
+          courseNextPoint:    async (deviceId) => autopilot.courseNextPoint()
         },
         [autopilot.type]
       )
