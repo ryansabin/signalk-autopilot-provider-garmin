@@ -284,7 +284,7 @@
     "type": "function",
     "z": "32739140ce85e012",
     "name": "build request",
-    "func": "const TOK = 'Bearer REPLACE_WITH_YOUR_SIGNALK_TOKEN';\nconst base = 'http://localhost/signalk/v2/api/vessels/self/autopilots/garminReactor';\nconst a = msg.payload;\nlet method = 'PUT', url, body;\nif (a === 'standby' || a === 'auto' || a === 'wind') {\n    url = base + '/state';\n    body = { value: a };\n} else if (a === 'tack' || a === 'gybe') {\n    method = 'POST';\n    // direction in the path is required by the v2 API but ignored by the plugin,\n    // which picks the correct tack/gybe direction from the apparent wind.\n    url = base + '/' + a + '/starboard';\n    body = {};\n} else {\n    const map = { '+1': 0.0174533, '+10': 0.174533, '-1': -0.0174533, '-10': -0.174533 };\n    url = base + '/target/adjust';\n    body = { value: map[a] };\n}\nmsg.method = method;\nmsg.url = url;\nmsg.headers = { 'Authorization': TOK, 'Content-Type': 'application/json' };\nmsg.payload = body;\nreturn msg;",
+    "func": "const TOK = 'Bearer REPLACE_WITH_YOUR_SIGNALK_TOKEN';\nconst base = 'http://localhost/signalk/v2/api/vessels/self/autopilots/garminReactor';\nconst a = msg.payload;\nlet method = 'PUT', url, body;\nif (a === 'standby' || a === 'auto' || a === 'wind' || a === 'route') {\n    url = base + '/state';\n    body = { value: a };\n} else if (a === 'tack' || a === 'gybe') {\n    method = 'POST';\n    // direction in the path is required by the v2 API but ignored by the plugin,\n    // which picks the correct tack/gybe direction from the apparent wind.\n    url = base + '/' + a + '/starboard';\n    body = {};\n} else {\n    const map = { '+1': 0.0174533, '+10': 0.174533, '-1': -0.0174533, '-10': -0.174533 };\n    url = base + '/target/adjust';\n    body = { value: map[a] };\n}\nmsg.method = method;\nmsg.url = url;\nmsg.headers = { 'Authorization': TOK, 'Content-Type': 'application/json' };\nmsg.payload = body;\nreturn msg;",
     "outputs": 1,
     "noerr": 0,
     "initialize": "",
@@ -1413,7 +1413,7 @@
     "name": "Mode",
     "page": "a9f10100c0de0002",
     "width": "6",
-    "height": "1",
+    "height": "2",
     "order": 4,
     "showTitle": true,
     "className": "",
@@ -1481,5 +1481,44 @@
     "disabled": "false",
     "groupType": "default",
     "z": "32739140ce85e012"
+  },
+  {
+    "id": "a9f10100c0de0017",
+    "type": "ui-button",
+    "z": "32739140ce85e012",
+    "group": "a9f10100c0de0003",
+    "name": "Route",
+    "label": "ROUTE",
+    "order": 4,
+    "width": 2,
+    "height": 1,
+    "emulateClick": false,
+    "tooltip": "Engage nav-follow toward the chartplotter's active waypoint",
+    "color": "",
+    "bgcolor": "",
+    "className": "",
+    "icon": "",
+    "iconPosition": "left",
+    "payload": "route",
+    "payloadType": "str",
+    "topic": "",
+    "topicType": "str",
+    "buttonColor": "",
+    "textColor": "",
+    "iconColor": "",
+    "enableClick": true,
+    "enablePointerdown": false,
+    "pointerdownPayload": "",
+    "pointerdownPayloadType": "str",
+    "enablePointerup": false,
+    "pointerupPayload": "",
+    "pointerupPayloadType": "str",
+    "x": 150,
+    "y": 260,
+    "wires": [
+      [
+        "a9f10100c0de0020"
+      ]
+    ]
   }
 ]
