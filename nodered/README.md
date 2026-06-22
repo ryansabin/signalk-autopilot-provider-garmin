@@ -15,13 +15,13 @@ tack/gybe, steering patterns, and a live status readout. Optional; the plugin wo
 
 ## Install
 1. In Node-RED: **menu → Import**, paste the contents of `autopilot-dashboard.flows.json`, and deploy.
-2. **Set your Signal K token.** Three function nodes — *build request*, *build pattern request*,
-   *build tack/gybe request* — contain:
+2. **Set your Signal K token.** Two function nodes — *build request* (v2: modes, target adjust,
+   tack/gybe) and *build pattern request* (v1: steering patterns) — contain:
    ```js
    const TOK='Bearer REPLACE_WITH_YOUR_SIGNALK_TOKEN';
    ```
    Replace `REPLACE_WITH_YOUR_SIGNALK_TOKEN` with a Signal K access token (Signal K → Security →
-   Access Requests / Devices, or a personal token). All three must match.
+   Access Requests / Devices, or a personal token). Both must match.
 3. **Assign the page to your dashboard.** The imported `ui-page` references a Dashboard 2.0 UI base
    and theme that aren't included in the export — open the page config and pick (or create) your own
    UI base + theme, then deploy.
