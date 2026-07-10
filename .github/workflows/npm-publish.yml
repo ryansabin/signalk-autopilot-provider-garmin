@@ -16,5 +16,5 @@ jobs:
         with:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
-      - run: npm install -g npm@latest && npm install
+      - run: npm install -g npm@11 && npm install
       - run: npm publish --provenance --access public
