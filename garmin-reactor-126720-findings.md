@@ -41,7 +41,6 @@ pattern codes were confirmed in power-displacement vessel mode on 2026-06-21):
 | Wind hold (apparent) | `11` | sailboat; CCU then broadcasts wind-target field `00 0B`. Only **apparent** wind hold exists on this boat — no separate true-wind code (true wind needs a boat-speed source). |
 | **Tack / Gybe** | `13` | sailing maneuver from wind/heading hold; preceded by selector `04 A2 00 <dir>` (`dir` = turn direction). Tack and gybe send the **same** command — the CCU decides which from the wind geometry. |
 | **Autopilot Setup Mode** | `07` | display "Autopilot in Setup Mode"; drives the rudder briefly (commissioning state), not a runtime steering mode |
-| Steering-test drive | `15` | engages drive and drives the rudder |
 | **Circles pattern** | `08` | preceded by selector `04 34 00 <dir>` |
 | **Zigzag pattern** | `09` | no direction selector (single engage) |
 | **Williamson turn** | `0A` | preceded by selector `04 47 00 <dir>` |
