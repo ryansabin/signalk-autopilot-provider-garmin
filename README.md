@@ -31,7 +31,7 @@ CCU's broadcast of the same PGN back into live `state` / `engaged` / `target`.
 | Powerboat patterns | zigzag, circles, U-turn, Williamson (+ time / amplitude params) |
 | GPS patterns | orbit, cloverleaf, search (require an active route on the plotter) |
 | Route / Go-To follow | nav-follow engage (see limitations re: nav-source arbitration) |
-| Live status | `state`, `engaged`, `target` published to `steering.autopilot.*` |
+| Live status | `state`, `mode`, `engaged`, `target` published to `steering.autopilot.*` |
 
 ### How the mode is known
 The CCU **never broadcasts its own discrete mode**. Instead, every controller (GHC, chartplotter,
@@ -41,7 +41,7 @@ or this plugin) sets the mode with a command on the bus, and the plugin watches 
 E5 98 10 17 04 04 05 0A 00 <code>   02=standby 05=heading 11=wind 0D=route  08/09/0A/0B/0E/0F/10=patterns
 ```
 
-So `state` is correct regardless of which device engaged the mode. Engaged-vs-standby comes from the
+So `mode` (`compass`/`wind`/`route`) is correct regardless of which device engaged it. Engaged-vs-standby comes from the
 CCU's broadcast markers (`00 A2` / `02 74` / `00 72` at ~2 Hz). The desired heading/wind `target` is
 reconstructed from the bus target-adjust steps (`26 <code>`) seeded from the sensor value at engage —
 because the CCU does not broadcast the target either.
@@ -49,16 +49,14 @@ because the CCU does not broadcast the target either.
 ## API
 
 Standard Signal K **v2** autopilot endpoints (`/signalk/v2/api/vessels/self/autopilots/garminReactor/…`):
-`state` (auto / wind / route / standby), `target/adjust`, `engage` / `disengage`,
+`state` (auto/standby), `mode` (compass/wind/route), `target/adjust`, `engage` / `disengage`,
 `tack/{port|starboard}`, `gybe/{port|starboard}`, and `courseCurrentPoint` (engages nav-follow toward
-the active waypoint). `courseNextPoint`, `setTarget` and `dodge` are implemented as throwing stubs —
-the Reactor advances waypoints at the chartplotter and has no absolute-target / dodge PGN.
+the active waypoint). `dodge` steers off the held course with quantized heading nudges (the Reactor has
+no native dodge PGN). `courseNextPoint` and `setTarget` are throwing stubs — the Reactor advances
+waypoints at the chartplotter and has no absolute-target PGN.
 
-The provider also publishes an **`actions`** list (`tack`, `gybe`, `courseCurrentPoint`, …) with
-`available` flags that track the current state, so clients like Freeboard can show only what's usable.
-
-> Note: this provider exposes everything through `state`; `mode` is always `null`. Clients should read
-> `state`, not `mode`.
+The provider also publishes an **`actions`** list (`tack`, `gybe`, `courseCurrentPoint`, `dodge`, …) with
+`available` flags that track the current state and mode, so clients like Freeboard can show only what's usable.
 
 Garmin-specific operations the v2 standard doesn't cover are exposed as **v1 PUT** paths:
 - `steering.autopilot.rudder.pattern` — value `"<name>:<dir>"`, e.g. `circles:stbd`, `uturn:port`,

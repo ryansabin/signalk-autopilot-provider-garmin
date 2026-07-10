@@ -30,8 +30,11 @@ const CMD = {
   heading: '%s,7,126720,%s,%s,09,E5,98,10,17,04,04,26,%s,00,FF,FF,FF,FF',
   state:   '%s,7,126720,%s,%s,0B,E5,98,10,17,04,04,05,0A,00,%s,00,FF,FF'
 }
-const HEADING_CODE = { '1': '02', '10': '03', '15': '03', '-1': '00', '-10': '01', '-15': '01' }
-const STATE_CODE = { auto: '05', standby: '02', wind: '11', route: '0D' }
+const HEADING_CODE = { '1': '02', '10': '03', '-1': '00', '-10': '01' }
+// Steering behaviour ("mode") -> Garmin engage wire code. On the Reactor, selecting a mode and
+// engaging are the same command, so engaging in a mode == sending its code.
+const MODE_CODE = { compass: '05', wind: '11', route: '0D' }
+const STANDBY_CODE = '02'
 
 // Controller-registration keepalive. The GHC heads broadcast this ~2 Hz to the
 // CCU; without it the Reactor treats us as an unregistered sender and faults to
@@ -59,19 +62,24 @@ const PATTERNS = {
   gybe:       { sel: 'A2', code: '13' }
 }
 
+// SignalK v2 splits engagement (state) from steering behaviour (mode), matching the reference
+// providers (pypilot etc.): state = auto|standby, mode = compass|wind|route.
 const AP_OPTIONS = {
   states: [
-    { name: 'auto', engaged: true },     // compass heading hold
-    { name: 'wind', engaged: true },     // apparent wind hold
-    { name: 'route', engaged: true },    // nav / route follow (observed only; engaged from the plotter)
-    { name: 'standby', engaged: false }
+    { name: 'auto', engaged: true },     // engaged in the current mode
+    { name: 'standby', engaged: false }  // disengaged
   ],
-  modes: []
+  modes: ['compass', 'wind', 'route'],   // compass = heading hold, wind = apparent-wind hold, route = nav follow
+  actions: []
 }
 
 // Status-decode tuning
 const WIND_FID = [0x00, 0x0B]
 const ENGAGED_FIDS = [[0x00, 0xA2], [0x02, 0x74], [0x00, 0x72]]
+// Only these field keys are consulted by evaluate(); it prunes exactly the keys it reads. The CCU
+// broadcasts many other fields at ~24 Hz, so recording every field key would grow `seen` without
+// bound (evaluate never prunes keys it doesn't query). Record only the tracked keys.
+const TRACKED_FIDS = new Set([WIND_FID, ...ENGAGED_FIDS].map((f) => f[0] + ':' + f[1]))
 // The CCU never broadcasts its discrete mode, so we read the MODE-SET COMMANDS on the bus
 // instead. Any controller sets the CCU mode with the frame  10 17 04 04 05 0A 00 <code>  :
 // the GHC (src 5) sends 02/05/11 for standby/heading/wind, the chartplotter (src 4) sends 0D
@@ -120,8 +128,10 @@ module.exports = function (app) {
   let lastActionsKey = ''        // signature of the last actions array pushed (dedupe deltas)
   let lastHeading = null         // radians, vessel heading from PGN 127250 (CCU)
   let lastApparentWind = null    // radians (signed +-pi), apparent wind angle from PGN 130306
-  let trackedTarget = null       // radians, target heading tracked locally in auto mode
+  let trackedTarget = null       // radians, target heading tracked locally in compass mode
   let trackedWind = null         // radians (signed +-pi), desired wind angle tracked in wind mode
+  let curMode = 'compass'        // last selected steering mode; engage() re-engages this mode
+  let dodgeOffset = 0            // radians of heading nudge applied by dodge(), undone on dodge(null)
   let lastCmdMode = null         // mode from the last 05 0A 00 <code> command seen on the bus
   let evalTimer = null
   let kaTimer = null
@@ -187,30 +197,57 @@ module.exports = function (app) {
     actions: status.actions || []
   })
 
-  pilot.setState = (value) => {
-    const code = STATE_CODE[value]
-    if (code === undefined) throw new Error('Unsupported state: ' + value + ' (known: auto, wind, route, standby)')
+  // setMode selects the steering behaviour. On the Reactor this also engages, so setMode leaves us
+  // in state 'auto'. Locally seed the tracked target (the CCU doesn't broadcast it decodably).
+  pilot.setMode = (mode) => {
+    const code = MODE_CODE[mode]
+    if (code === undefined) throw new Error('Unsupported mode: ' + mode + ' (known: compass, wind, route)')
+    if (mode === 'route' && !routeTarget) {
+      throw new Error('route mode needs a waypoint — use the steering.autopilot.route.goto PUT')
+    }
     send(util.format(CMD.state, now(), srcAddr, ccuAddr, code))
-    status.state = value
-    status.engaged = (value !== 'standby')
-    // Locally track the target (the CCU doesn't broadcast it decodably).
-    if (value === 'auto') { trackedTarget = lastHeading; trackedWind = null }            // hold current heading
-    else if (value === 'wind') { trackedWind = lastApparentWind; trackedTarget = null }  // hold current apparent wind angle
-    else { trackedTarget = null; trackedWind = null }                                    // standby / route (no local target)
+    curMode = mode
+    status.mode = mode
+    status.state = 'auto'
+    status.engaged = true
+    dodgeOffset = 0
+    if (mode === 'compass') { trackedTarget = lastHeading; trackedWind = null }
+    else if (mode === 'wind') { trackedWind = lastApparentWind; trackedTarget = null }
+    else { trackedTarget = null; trackedWind = null }
     return status.engaged
+  }
+
+  // setState toggles engagement: 'auto' re-engages the current mode, 'standby' disengages.
+  pilot.setState = (value) => {
+    if (value === 'auto') return pilot.setMode(curMode)
+    if (value === 'standby') {
+      send(util.format(CMD.state, now(), srcAddr, ccuAddr, STANDBY_CODE))
+      status.state = 'standby'
+      status.engaged = false
+      trackedTarget = null; trackedWind = null; dodgeOffset = 0
+      return false
+    }
+    throw new Error('Unsupported state: ' + value + ' (known: auto, standby)')
   }
 
   pilot.engage = () => pilot.setState('auto')
   pilot.disengage = () => pilot.setState('standby')
-  pilot.setMode = (mode) => pilot.setState(mode)
 
   // Course API hooks. courseCurrentPoint engages nav-follow toward the active waypoint (route
   // mode). Advancing to the next waypoint is owned by the chartplotter on the Reactor and can't
   // be commanded from Signal K, so courseNextPoint throws (per the provider contract).
-  pilot.courseCurrentPoint = () => { pilot.setState('route'); return 'engaged nav-follow (active waypoint)' }
+  // Follows the chartplotter's active waypoint (not our internal routeTarget), so it engages the
+  // Reactor's nav-follow state directly rather than going through setMode('route').
+  pilot.courseCurrentPoint = () => {
+    send(util.format(CMD.state, now(), srcAddr, ccuAddr, MODE_CODE.route))
+    curMode = 'route'; status.mode = 'route'; status.state = 'auto'; status.engaged = true
+    trackedTarget = null; trackedWind = null; dodgeOffset = 0
+    return 'engaged nav-follow (active waypoint)'
+  }
   pilot.courseNextPoint = () => { throw new Error('advancing to the next waypoint is controlled from the chartplotter on Garmin Reactor') }
 
   pilot.adjustTarget = (value) => {
+    if (typeof value !== 'number' || !isFinite(value)) throw new Error('adjustTarget requires a finite number (radians)')
     if (!status.engaged) app.debug('adjustTarget while not engaged; sending anyway')
     const step = quantizeStep(radToDeg(value))
     const code = HEADING_CODE[step]
@@ -227,7 +264,19 @@ module.exports = function (app) {
   // fallback when no wind is available.
   pilot.tack = (direction) => engagePattern('tack', maneuverDir('tack') || direction)
   pilot.gybe = (direction) => engagePattern('gybe', maneuverDir('gybe') || direction)
-  pilot.dodge = () => { throw new Error('dodge not implemented for Garmin Reactor') }
+  // dodge(value): steer off the held course by `value` radians using quantized heading nudges.
+  // dodge(null): reverse the accumulated offset to return to course. The Reactor has no native
+  // dodge, so this approximates one on the heading-nudge primitive; it applies to compass/wind hold.
+  pilot.dodge = (value) => {
+    if (value === null || value === undefined) {
+      if (dodgeOffset !== 0) { nudgeByRad(-dodgeOffset); dodgeOffset = 0 }
+      return 'dodge cleared'
+    }
+    if (typeof value !== 'number' || !isFinite(value)) throw new Error('dodge requires a number (radians) or null')
+    const applied = nudgeByRad(value)
+    dodgeOffset += applied
+    return 'dodge ' + Math.round(radToDeg(applied)) + ' deg'
+  }
 
   // ---- Config schema (pure; no side effects — discovery happens in start()) ----
   pilot.properties = () => ({
@@ -356,9 +405,11 @@ module.exports = function (app) {
       const fhi = bytes[idx + 4]
       const flo = bytes[idx + 5]
       const k = fhi + ':' + flo
-      const arr = seen.get(k) || []
-      arr.push(ts)
-      seen.set(k, arr)
+      if (TRACKED_FIDS.has(k)) {                 // bounded: evaluate() prunes exactly these keys
+        const arr = seen.get(k) || []
+        arr.push(ts)
+        seen.set(k, arr)
+      }
       // (We only need the PRESENCE/rate of WIND_FID + engaged markers, counted via `seen`.
       // The CCU's 00 0B float value is the measured apparent wind, which we already get from
       // PGN 130306, so it isn't decoded here.)
@@ -372,7 +423,7 @@ module.exports = function (app) {
     // Off-line: candump not running, or no frame heard from the CCU within OFFLINE_MS.
     if (candump === null || lastCcuRx === 0 || (t - lastCcuRx) > OFFLINE_MS) {
       if (!wasOffline) { wasOffline = true; setError('Reactor CCU not responding on ' + canInterface) }
-      publish('off-line', false, null)
+      publish('off-line', curMode, false, null)
       return
     }
     if (wasOffline) { wasOffline = false; setStatus('Connected to Reactor CCU' + (ccuAddr ? ' at addr ' + ccuAddr : '')) }
@@ -386,49 +437,54 @@ module.exports = function (app) {
     ENGAGED_FIDS.forEach((f) => { engHits += cnt(f[0] + ':' + f[1], ENGAGED_WINDOW_MS) })
     const windHits = cnt(WIND_FID[0] + ':' + WIND_FID[1], WIND_WINDOW_MS)
 
-    let state, engaged, target = null
+    // Map the bus-observed steering token (auto/wind/route) onto the SignalK mode vocabulary.
+    const TOKEN_MODE = { auto: 'compass', wind: 'wind', route: 'route' }
+    let state, engaged, mode = curMode, target = null
     if (engHits >= ENGAGED_MIN) {
-      // Engaged. Mode = the last mode-set command observed on the bus (authoritative; works
-      // no matter which device engaged it). If we haven't seen a command yet this session,
-      // fall back to the wind-field heuristic (wind hold streams 00 0B; heading hold doesn't).
+      // Engaged. Steering mode = the last mode-set command observed on the bus (authoritative; works
+      // no matter which device engaged it). If we haven't seen a command yet this session, fall back
+      // to the wind-field heuristic (wind hold streams 00 0B; heading hold doesn't).
       engaged = true
-      if (lastCmdMode && lastCmdMode !== 'standby') state = lastCmdMode
-      else state = (windHits >= WIND_MIN) ? 'wind' : 'auto'
+      state = 'auto'
+      const token = (lastCmdMode && TOKEN_MODE[lastCmdMode]) ? lastCmdMode : null
+      mode = token ? TOKEN_MODE[token] : ((windHits >= WIND_MIN) ? 'wind' : (curMode === 'route' ? 'compass' : curMode))
+      curMode = mode
       // Seed a baseline if we came up already engaged (missed the engage command after a restart).
-      if (state === 'auto' && trackedTarget === null && lastHeading !== null) trackedTarget = lastHeading
-      else if (state === 'wind' && trackedWind === null && lastApparentWind !== null) trackedWind = lastApparentWind
-      target = (state === 'wind') ? trackedWind : trackedTarget
+      if (mode === 'compass' && trackedTarget === null && lastHeading !== null) trackedTarget = lastHeading
+      else if (mode === 'wind' && trackedWind === null && lastApparentWind !== null) trackedWind = lastApparentWind
+      target = (mode === 'wind') ? trackedWind : trackedTarget
     } else {
-      engaged = false; state = 'standby'
+      engaged = false; state = 'standby'   // mode retains curMode (the would-be steering behaviour)
     }
-    publish(state, engaged, target)
+    // trackedTarget/trackedWind lifecycle is driven by setMode/adjustTarget (commands), not by
+    // the detected state, so the engage transient doesn't wipe it.
+    publish(state, mode, engaged, target)
   }
 
   // Action-availability the server advertises to clients (Freeboard etc.) via apInfo.actions.
   // Only the standard action ids are valid (dodge/tack/gybe/courseCurrentPoint/courseNextPoint);
   // the Garmin steering patterns aren't standard actions and stay on the custom PUT path.
-  function buildActions (state, engaged) {
+  function buildActions (state, mode, engaged) {
     const online = state !== 'off-line'
     const windKnown = lastApparentWind !== null && isFinite(lastApparentWind)
-    const sailing = engaged && (state === 'wind' || state === 'auto')
+    const sailing = engaged && (mode === 'wind' || mode === 'compass')
     return [
       { id: 'tack', name: 'Tack', available: online && sailing && windKnown },
       { id: 'gybe', name: 'Gybe', available: online && sailing && windKnown },
       { id: 'courseCurrentPoint', name: 'Follow active waypoint', available: online },
       { id: 'courseNextPoint', name: 'Advance to next waypoint', available: false },
-      { id: 'dodge', name: 'Dodge', available: false }
+      { id: 'dodge', name: 'Dodge', available: online && engaged }
     ]
   }
 
-  function publish (state, engaged, target) {
-    const actions = buildActions(state, engaged)
+  function publish (state, mode, engaged, target) {
+    const actions = buildActions(state, mode, engaged)
     const actionsKey = actions.map((a) => a.id + (a.available ? '1' : '0')).join(',')
-    const changed = state !== status.state
-    if (changed) app.debug('Garmin AP state -> %s (engaged=%s)', state, engaged)
-    // mode stays null: the Reactor exposes everything through state; we define no separate modes.
-    status.state = state; status.mode = null; status.engaged = engaged; status.target = target; status.actions = actions
+    const changed = state !== status.state || mode !== status.mode
+    if (changed) app.debug('Garmin AP -> state=%s mode=%s (engaged=%s)', state, mode, engaged)
+    status.state = state; status.mode = mode; status.engaged = engaged; status.target = target; status.actions = actions
     if (typeof app.autopilotUpdate === 'function') {
-      const upd = { state, mode: null, engaged, target }
+      const upd = { state, mode, engaged, target }
       if (actionsKey !== lastActionsKey) { upd.actions = actions; lastActionsKey = actionsKey }   // only on change
       try { app.autopilotUpdate(apType, upd) } catch (e) { if (changed) app.debug('autopilotUpdate failed: ' + e.message) }
     }
@@ -446,10 +502,25 @@ module.exports = function (app) {
   // destination waypoint; we patch the waypoint lat (bytes 32-35) and lon (36-39).
   const NAV285 = [0xFF, 0xFF, 0x02, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xE0, 0x02, 0x01, 0xFF, 0xFF, 0xFF, 0x02, 0x01, 0xFF, 0xFF, 0xFF, 0x7F, 0xFF, 0xFF, 0xFF, 0x7F, 0x08, 0x00, 0x06, 0x01, 0x30, 0x30, 0x39, 0x33, 0x25, 0x45, 0x65, 0x16, 0x21, 0x32, 0x27, 0xB7]
   const NAV_MS = 500
+  const WP_ARRIVAL_M = 15         // waypoint-arrival radius; fires the arrival alarm within this range
   let routeTarget = null
   let routeStart = null
   let routeTimer = null
   let nav285ctr = 0
+  let arrived = false             // latched once inside WP_ARRIVAL_M; rearmed on a new goto
+
+  // Raise an autopilot notification (waypointArrival / routeComplete / xte / ...). Emitted through
+  // both the v2 autopilot alarm channel and a standard SignalK notification delta, whichever the
+  // running server supports; both paths are guarded so an unsupported one is a silent no-op.
+  function raiseAlarm (type, message, state) {
+    const value = { state, method: state === 'normal' ? [] : ['sound', 'visual'], message }
+    if (typeof app.autopilotUpdate === 'function') {
+      try { app.autopilotUpdate(apType, { alarm: { path: type, value } }) } catch (e) { app.debug('alarm via autopilotUpdate failed: ' + e.message) }
+    }
+    if (typeof app.handleMessage === 'function') {
+      try { app.handleMessage(apType, { updates: [{ values: [{ path: 'notifications.autopilot.' + type, value }] }] }) } catch (e) { app.debug('alarm via handleMessage failed: ' + e.message) }
+    }
+  }
 
   function toRad (d) { return d * Math.PI / 180 }
   function distBrg (la1, lo1, la2, lo2) {
@@ -476,6 +547,8 @@ module.exports = function (app) {
     const pos = (typeof app.getSelfPath === 'function') ? app.getSelfPath('navigation.position.value') : null
     if (!pos || !routeTarget || typeof pos.latitude !== 'number') return
     const { dist, brg } = distBrg(pos.latitude, pos.longitude, routeTarget.lat, routeTarget.lon)
+    if (!arrived && dist <= WP_ARRIVAL_M) { arrived = true; raiseAlarm('waypointArrival', 'Waypoint arrival', 'alarm') }
+    else if (arrived && dist > WP_ARRIVAL_M * 1.5) { arrived = false }   // hysteresis re-arm on departure
     let xte = 0
     try { if (routeStart) xte = crossTrack(pos.latitude, pos.longitude, routeStart.lat, routeStart.lon, routeTarget.lat, routeTarget.lon) } catch (e) {}
     const b = NAV284.slice()
@@ -502,6 +575,7 @@ module.exports = function (app) {
     if (!pos || typeof pos.latitude !== 'number') throw new Error('no GPS position; cannot start route')
     routeTarget = { lat, lon }
     routeStart = { lat: pos.latitude, lon: pos.longitude }
+    arrived = false
     emitNav()                                                    // prime the nav data before engaging
     send(util.format(CMD.state, now(), srcAddr, ccuAddr, '0D')) // engage nav-follow
     if (routeTimer) clearInterval(routeTimer)
@@ -510,8 +584,11 @@ module.exports = function (app) {
   }
   function gotoStop () {
     if (routeTimer) { clearInterval(routeTimer); routeTimer = null }
+    const wasArrived = arrived
     routeTarget = null
-    send(util.format(CMD.state, now(), srcAddr, ccuAddr, STATE_CODE.standby))
+    arrived = false
+    send(util.format(CMD.state, now(), srcAddr, ccuAddr, STANDBY_CODE))
+    if (wasArrived) raiseAlarm('routeComplete', 'Route complete', 'normal')
     return 'route stopped'
   }
 
@@ -588,6 +665,18 @@ module.exports = function (app) {
   function quantizeStep (deg) {
     const sz = Math.abs(deg) >= 6 ? 10 : 1
     return (deg < 0 ? '-' : '') + sz
+  }
+  // Steer by `rad` using the Reactor's discrete heading nudges (±1° / ±10°). Decomposes the angle
+  // into 10° and 1° presses; returns the whole-degree angle (radians) actually applied.
+  function nudgeByRad (rad) {
+    let deg = Math.round(radToDeg(rad))
+    const sign = deg < 0 ? -1 : 1
+    deg = Math.abs(deg)
+    const tens = Math.floor(deg / 10)
+    const ones = deg % 10
+    for (let i = 0; i < tens; i++) send(util.format(CMD.heading, now(), srcAddr, ccuAddr, HEADING_CODE[sign < 0 ? '-10' : '10']))
+    for (let i = 0; i < ones; i++) send(util.format(CMD.heading, now(), srcAddr, ccuAddr, HEADING_CODE[sign < 0 ? '-1' : '1']))
+    return sign * (tens * 10 + ones) * Math.PI / 180
   }
 
   return pilot
