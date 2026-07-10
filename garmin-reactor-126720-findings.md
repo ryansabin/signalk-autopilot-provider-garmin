@@ -41,7 +41,7 @@ pattern codes were confirmed in power-displacement vessel mode on 2026-06-21):
 | Wind hold (apparent) | `11` | sailboat; CCU then broadcasts wind-target field `00 0B`. Only **apparent** wind hold exists on this boat — no separate true-wind code (true wind needs a boat-speed source). |
 | **Tack / Gybe** | `13` | sailing maneuver from wind/heading hold; preceded by selector `04 A2 00 <dir>` (`dir` = turn direction). Tack and gybe send the **same** command — the CCU decides which from the wind geometry. |
 | **Autopilot Setup Mode** | `07` | display "Autopilot in Setup Mode"; drives the rudder briefly (commissioning state), not a runtime steering mode |
-| Steering-test drive | `15` | engages drive and drives the rudder (see rudder section) |
+| Steering-test drive | `15` | engages drive and drives the rudder |
 | **Circles pattern** | `08` | preceded by selector `04 34 00 <dir>` |
 | **Zigzag pattern** | `09` | no direction selector (single engage) |
 | **Williamson turn** | `0A` | preceded by selector `04 47 00 <dir>` |
@@ -223,33 +223,6 @@ plotter**, which persists in every AP mode until you cancel nav on the plotter �
 Remaining 126720 status field-ids (heading, rudder angle, target heading) are live LE int/float
 values; mapping them would let the plugin publish full `target.headingMagnetic` /
 `target.windAngleApparent`. Not required for state/mode, which the command stream now covers.
-
-## Rudder NFU jog + auto-center — NEW (2026-06-20, verified live)
-
-The Reactor has no public way to move the rudder without engaging heading/wind hold.
-Decoded the **steering-test drive mode** from the GHC's "steering-direction test"
-(captured src5 → CCU2), and drove the rudder under software control for the first time.
-All three commands are the same `E5 98 10 17 04 04` family:
-
-| Action | bytes | notes |
-|---|---|---|
-| Enter steering-test (engages drive/clutch) | `05 0A 00 15` | a STATE command, **new code 15** |
-| Jog rudder one step | `04 15 00 <dir>` | `00` = starboard / +angle, `01` = port / −angle |
-| Exit → standby | `05 0A 00 02` | normal standby code |
-
-Measured **~1.8° per jog pulse**. The CCU **ignores raw `cansend` injection** of these —
-they are only honoured when sent through SignalK's registered N2K device (canboatjs),
-the same path the state/heading commands use. Once in test mode the clutch emits the
-same engaged-markers as heading-hold, so the status decoder suppresses mode inference
-while a jog/center run is active (and ~3.5 s after, while the drive disengages).
-
-Closed-loop **auto-center** (`centerRudder()`): enter test mode, read
-`steering.rudderAngle`, jog toward zero, self-correct direction if |angle| grows,
-stop within ~2° (one step) with a cross-zero backstop, exit to standby. A 6 s idle
-watchdog force-exits if jogging stalls. Verified: centered from ±24° to within 2°,
-AP status stayed `standby` throughout. Exposed as SignalK PUT paths
-`steering.autopilot.rudder.{center,jog,stop}` and as a **Rudder** group on the
-Node-RED autopilot dashboard (CENTER RUDDER / JOG PORT / JOG STBD).
 
 ## Artifacts (preserved on the Pi)
 
